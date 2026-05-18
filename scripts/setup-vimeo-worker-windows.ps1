@@ -169,6 +169,34 @@ param(
 "@
 $shortcut | Set-Content -LiteralPath $shortcutPath -Encoding UTF8
 
+Write-Step "Criando agent de controle"
+$agentPath = Join-Path $InstallPath "start-vimeo-agent.ps1"
+$agent = @"
+`$ErrorActionPreference = "Stop"
+Set-Location "$InstallPath"
+`$env:CI_VIMEO_WORKER_NAME = "$WorkerName"
+npm run agent
+"@
+$agent | Set-Content -LiteralPath $agentPath -Encoding UTF8
+
+$taskName = "CI_Vimeo_Worker_Agent"
+try {
+  $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$agentPath`""
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+  $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Description "Agent CI Vimeo Worker" -Force | Out-Null
+  Write-Host "Tarefa agendada criada: $taskName"
+  if (Test-Path (Join-Path $InstallPath ".env.local")) {
+    Start-ScheduledTask -TaskName $taskName
+    Write-Host "Agent iniciado."
+  } else {
+    Write-Host "Agent criado, mas nao iniciado porque .env.local ainda nao existe." -ForegroundColor Yellow
+  }
+} catch {
+  Write-Host "Nao consegui criar/iniciar a tarefa do agent: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
 Write-Step "Teste rapido"
 Push-Location $InstallPath
 node -v
@@ -184,3 +212,6 @@ Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vime
 Write-Host ""
 Write-Host "Rodar real:"
 Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vimeo-worker.ps1`" -Execute -Notify"
+Write-Host ""
+Write-Host "Iniciar agent do painel:"
+Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vimeo-agent.ps1`""

@@ -8,6 +8,7 @@
   },
   "scripts": {
     "migrate": "TS_NODE_BASEURL=. node -r tsconfig-paths/register ./node_modules/jiti/bin/jiti.js scripts/migrate-vimeo-to-r2.ts",
+    "agent": "TS_NODE_BASEURL=. node -r tsconfig-paths/register ./node_modules/jiti/bin/jiti.js scripts/worker-agent.ts",
     "video:migrate-vimeo": "npm run migrate",
     "typecheck": "tsc --noEmit",
     "smoke": "node -e \"console.log('worker ok')\""
