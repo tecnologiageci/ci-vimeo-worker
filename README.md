@@ -9,6 +9,12 @@ Ele baixa o MP4 do Vimeo, sobe o MP4 original para o R2, converte para HLS, sobe
 Abra o PowerShell como administrador e rode:
 
 ```powershell
+irm https://raw.githubusercontent.com/tecnologiageci/ci-vimeo-worker/main/scripts/bootstrap-windows.ps1 -OutFile "$env:TEMP\ci-vimeo-bootstrap.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\ci-vimeo-bootstrap.ps1" -WorkerName PC-RTX-01
+```
+
+Ou, se ja clonou o repositorio:
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-vimeo-worker-windows.ps1 -WorkerName PC-RTX-01 -InstallPath C:\ci-vimeo-runner
 ```
 

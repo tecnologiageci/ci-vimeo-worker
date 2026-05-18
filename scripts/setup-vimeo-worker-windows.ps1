@@ -5,6 +5,7 @@ param(
   [string]$WorkerName = $env:COMPUTERNAME,
   [string]$EnvSource = "",
   [switch]$InstallZeroTier,
+  [switch]$SkipRepoUpdate,
   [switch]$SkipPackages,
   [switch]$Force
 )
@@ -63,10 +64,14 @@ if (Test-Path $InstallPath) {
   $hasFiles = (Get-ChildItem -LiteralPath $InstallPath -Force | Select-Object -First 1) -ne $null
 
   if ($hasGit) {
-    Write-Host "Repositorio ja existe. Atualizando..."
-    git -C $InstallPath fetch origin $Branch
-    git -C $InstallPath checkout $Branch
-    git -C $InstallPath pull --ff-only origin $Branch
+    if ($SkipRepoUpdate) {
+      Write-Host "Repositorio ja existe. Pulando atualizacao por -SkipRepoUpdate."
+    } else {
+      Write-Host "Repositorio ja existe. Atualizando..."
+      git -C $InstallPath fetch origin $Branch
+      git -C $InstallPath checkout $Branch
+      git -C $InstallPath pull --ff-only origin $Branch
+    }
   } elseif ($hasFiles -and -not $Force) {
     throw "A pasta ja existe e nao e um repositorio git. Use -Force ou escolha outro -InstallPath."
   } else {
