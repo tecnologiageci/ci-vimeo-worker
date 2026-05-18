@@ -1,5 +1,5 @@
 import { config as loadEnv } from 'dotenv'
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -40,8 +40,11 @@ const pollMs = envNumber('CI_VIMEO_AGENT_POLL_MS', 10_000)
 const machineType = envText('CI_VIMEO_WORKER_TYPE', inferMachineType())
 const logDir = path.join(process.cwd(), 'logs')
 const agentLogPath = path.join(logDir, `agent-${sanitizeFileName(workerName)}.log`)
+const dataDir = path.join(process.cwd(), 'data')
+const statusFilePath = path.join(dataDir, 'worker-agent-status.json')
 
 mkdirSync(logDir, { recursive: true })
+mkdirSync(dataDir, { recursive: true })
 const agentLog = createWriteStream(agentLogPath, { flags: 'a' })
 
 let child: ChildProcessWithoutNullStreams | null = null
@@ -327,8 +330,30 @@ function readConfigSummary() {
   }
 }
 
+function writeStatusFile() {
+  try {
+    writeFileSync(statusFilePath, JSON.stringify({
+      workerName,
+      displayName,
+      machineIp: getMachineIp(),
+      machineType,
+      status: state.status,
+      runName: state.runName,
+      currentVideo: state.currentVideo,
+      currentStage: state.currentStage,
+      progressPercent: state.progressPercent,
+      lastError: state.lastError,
+      heartbeatAt: new Date().toISOString(),
+      childPid,
+    }, null, 2))
+  } catch {
+    /* Nao derruba o agent por falha no arquivo de metricas. */
+  }
+}
+
 async function heartbeat() {
   if (!workerSecret) {
+    writeStatusFile()
     throw new Error('VIDEO_WORKER_CONTROL_SECRET ou CRON_SECRET não configurado.')
   }
 
@@ -369,6 +394,7 @@ async function heartbeat() {
   for (const command of (body.commands || []) as WorkerCommand[]) {
     handleCommand(command)
   }
+  writeStatusFile()
 }
 
 async function main() {

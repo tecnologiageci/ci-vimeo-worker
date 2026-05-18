@@ -179,6 +179,16 @@ npm run agent
 "@
 $agent | Set-Content -LiteralPath $agentPath -Encoding UTF8
 
+$metricsPath = Join-Path $InstallPath "start-vimeo-metrics.ps1"
+$metrics = @"
+`$ErrorActionPreference = "Stop"
+Set-Location "$InstallPath"
+`$env:CI_VIMEO_WORKER_NAME = "$WorkerName"
+`$env:CI_VIMEO_WORKER_METRICS_MACHINE = "$($WorkerName.ToLower())"
+npm run metrics
+"@
+$metrics | Set-Content -LiteralPath $metricsPath -Encoding UTF8
+
 $taskName = "CI_Vimeo_Worker_Agent"
 try {
   $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -195,6 +205,24 @@ try {
   }
 } catch {
   Write-Host "Nao consegui criar/iniciar a tarefa do agent: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+$metricsTaskName = "CI_Vimeo_Worker_Metrics"
+try {
+  $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$metricsPath`""
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+  $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName $metricsTaskName -Action $action -Trigger $trigger -Principal $principal -Description "Metrics CI Vimeo Worker" -Force | Out-Null
+  Write-Host "Tarefa agendada criada: $metricsTaskName"
+  if (Test-Path (Join-Path $InstallPath ".env.local")) {
+    Start-ScheduledTask -TaskName $metricsTaskName
+    Write-Host "Metrics exporter iniciado."
+  } else {
+    Write-Host "Metrics exporter criado, mas nao iniciado porque .env.local ainda nao existe." -ForegroundColor Yellow
+  }
+} catch {
+  Write-Host "Nao consegui criar/iniciar a tarefa de metricas: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 Write-Step "Teste rapido"
@@ -215,3 +243,6 @@ Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vime
 Write-Host ""
 Write-Host "Iniciar agent do painel:"
 Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vimeo-agent.ps1`""
+Write-Host ""
+Write-Host "Iniciar metricas Grafana:"
+Write-Host "  powershell -ExecutionPolicy Bypass -File `"$InstallPath\start-vimeo-metrics.ps1`""
