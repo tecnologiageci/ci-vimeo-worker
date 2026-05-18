@@ -3,7 +3,9 @@ param(
   [string]$WorkerName = $env:COMPUTERNAME,
   [string]$RepoUrl = "https://github.com/tecnologiageci/ci-vimeo-worker.git",
   [string]$Branch = "main",
+  [string]$ZeroTierNetworkId = "3b19b3a716c84da5",
   [switch]$InstallZeroTier,
+  [switch]$SkipZeroTier,
   [switch]$Force
 )
 
@@ -41,13 +43,61 @@ function Ensure-WingetPackage {
   Refresh-Path
 }
 
+function Get-ZeroTierCli {
+  $cmd = Get-Command zerotier-cli -ErrorAction SilentlyContinue
+  if ($cmd) {
+    return $cmd.Source
+  }
+
+  $default = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"
+  if (Test-Path $default) {
+    return $default
+  }
+
+  return ""
+}
+
+function Ensure-ZeroTierNetwork {
+  param([string]$NetworkId)
+
+  if (-not $NetworkId) {
+    return
+  }
+
+  Write-Step "Configurando ZeroTier"
+  $ztCli = Get-ZeroTierCli
+  if (-not $ztCli) {
+    Ensure-WingetPackage -CommandName "zerotier-cli" -PackageId "ZeroTier.ZeroTierOne"
+    $ztCli = Get-ZeroTierCli
+  }
+
+  if (-not $ztCli) {
+    throw "ZeroTier instalado, mas zerotier-cli nao foi encontrado. Feche e abra o PowerShell ou reinicie o PC."
+  }
+
+  $service = Get-Service -Name "ZeroTierOneService" -ErrorAction SilentlyContinue
+  if ($service) {
+    Set-Service -Name "ZeroTierOneService" -StartupType Automatic
+    if ($service.Status -ne "Running") {
+      Start-Service -Name "ZeroTierOneService"
+      Start-Sleep -Seconds 3
+    }
+  }
+
+  & $ztCli join $NetworkId | ForEach-Object { Write-Host $_ }
+  Start-Sleep -Seconds 2
+  & $ztCli listnetworks | ForEach-Object { Write-Host $_ }
+}
+
 Write-Step "Instalando dependencias basicas"
 Ensure-WingetPackage -CommandName "git" -PackageId "Git.Git"
 Ensure-WingetPackage -CommandName "node" -PackageId "OpenJS.NodeJS.LTS"
 Ensure-WingetPackage -CommandName "ffmpeg" -PackageId "Gyan.FFmpeg"
 
-if ($InstallZeroTier) {
-  Ensure-WingetPackage -CommandName "zerotier-cli" -PackageId "ZeroTier.ZeroTierOne"
+if (-not $SkipZeroTier) {
+  Ensure-ZeroTierNetwork -NetworkId $ZeroTierNetworkId
+} elseif ($InstallZeroTier) {
+  Ensure-ZeroTierNetwork -NetworkId $ZeroTierNetworkId
 }
 
 Refresh-Path

@@ -4,7 +4,9 @@ param(
   [string]$Branch = "main",
   [string]$WorkerName = $env:COMPUTERNAME,
   [string]$EnvSource = "",
+  [string]$ZeroTierNetworkId = "3b19b3a716c84da5",
   [switch]$InstallZeroTier,
+  [switch]$SkipZeroTier,
   [switch]$SkipRepoUpdate,
   [switch]$SkipPackages,
   [switch]$Force
@@ -47,13 +49,60 @@ function Refresh-Path {
   $env:Path = "$machinePath;$userPath"
 }
 
+function Get-ZeroTierCli {
+  $cmd = Get-Command zerotier-cli -ErrorAction SilentlyContinue
+  if ($cmd) {
+    return $cmd.Source
+  }
+
+  $default = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"
+  if (Test-Path $default) {
+    return $default
+  }
+
+  return ""
+}
+
+function Ensure-ZeroTierNetwork {
+  param([string]$NetworkId)
+
+  if (-not $NetworkId) {
+    return
+  }
+
+  Write-Step "Configurando ZeroTier"
+  $ztCli = Get-ZeroTierCli
+  if (-not $ztCli) {
+    Ensure-Command -Name "zerotier-cli" -WingetId "ZeroTier.ZeroTierOne"
+    Refresh-Path
+    $ztCli = Get-ZeroTierCli
+  }
+
+  if (-not $ztCli) {
+    throw "ZeroTier instalado, mas zerotier-cli nao foi encontrado. Feche e abra o PowerShell ou reinicie o PC."
+  }
+
+  $service = Get-Service -Name "ZeroTierOneService" -ErrorAction SilentlyContinue
+  if ($service) {
+    Set-Service -Name "ZeroTierOneService" -StartupType Automatic
+    if ($service.Status -ne "Running") {
+      Start-Service -Name "ZeroTierOneService"
+      Start-Sleep -Seconds 3
+    }
+  }
+
+  & $ztCli join $NetworkId | ForEach-Object { Write-Host $_ }
+  Start-Sleep -Seconds 2
+  & $ztCli listnetworks | ForEach-Object { Write-Host $_ }
+}
+
 Write-Step "Verificando dependencias"
 Ensure-Command -Name "git" -WingetId "Git.Git"
 Ensure-Command -Name "node" -WingetId "OpenJS.NodeJS.LTS"
 Ensure-Command -Name "ffmpeg" -WingetId "Gyan.FFmpeg"
 
-if ($InstallZeroTier) {
-  Ensure-Command -Name "zerotier-cli" -WingetId "ZeroTier.ZeroTierOne"
+if ($InstallZeroTier -and -not $SkipZeroTier) {
+  Ensure-ZeroTierNetwork -NetworkId $ZeroTierNetworkId
 }
 
 Refresh-Path

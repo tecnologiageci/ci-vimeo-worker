@@ -12,6 +12,14 @@ Abra o PowerShell como administrador e rode:
 irm https://raw.githubusercontent.com/tecnologiageci/ci-vimeo-worker/main/scripts/bootstrap-windows.ps1 -OutFile "$env:TEMP\ci-vimeo-bootstrap.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\ci-vimeo-bootstrap.ps1" -WorkerName PC-RTX-01
 ```
 
+Esse comando tambem instala o ZeroTier e entra na rede `3b19b3a716c84da5`. Depois autorize o novo dispositivo no painel do ZeroTier se ele aparecer como pendente.
+
+Para pular ZeroTier:
+
+```powershell
+irm https://raw.githubusercontent.com/tecnologiageci/ci-vimeo-worker/main/scripts/bootstrap-windows.ps1 -OutFile "$env:TEMP\ci-vimeo-bootstrap.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\ci-vimeo-bootstrap.ps1" -WorkerName PC-RTX-01 -SkipZeroTier
+```
+
 Ou, se ja clonou o repositorio:
 
 ```powershell
