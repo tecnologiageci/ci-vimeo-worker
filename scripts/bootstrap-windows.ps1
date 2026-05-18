@@ -3,6 +3,7 @@ param(
   [string]$WorkerName = $env:COMPUTERNAME,
   [string]$RepoUrl = "https://github.com/tecnologiageci/ci-vimeo-worker.git",
   [string]$Branch = "main",
+  [string]$EnvSource = "",
   [string]$ZeroTierNetworkId = "3b19b3a716c84da5",
   [switch]$InstallZeroTier,
   [switch]$SkipZeroTier,
@@ -122,6 +123,7 @@ Write-Step "Preparando runner"
 powershell -ExecutionPolicy Bypass -File (Join-Path $InstallPath "scripts\setup-vimeo-worker-windows.ps1") `
   -InstallPath $InstallPath `
   -WorkerName $WorkerName `
+  -EnvSource $EnvSource `
   -SkipRepoUpdate `
   -SkipPackages
 

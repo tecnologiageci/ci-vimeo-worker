@@ -189,6 +189,18 @@ npm run metrics
 "@
 $metrics | Set-Content -LiteralPath $metricsPath -Encoding UTF8
 
+try {
+  $existingRule = Get-NetFirewallRule -DisplayName "CI Vimeo Metrics" -ErrorAction SilentlyContinue
+  if (-not $existingRule) {
+    New-NetFirewallRule -Name "CI_Vimeo_Metrics" -DisplayName "CI Vimeo Metrics" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 9464 | Out-Null
+    Write-Host "Firewall liberado: porta 9464"
+  } else {
+    Write-Host "Firewall OK: porta 9464"
+  }
+} catch {
+  Write-Host "Nao consegui criar regra de firewall para 9464: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
 $taskName = "CI_Vimeo_Worker_Agent"
 try {
   $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
