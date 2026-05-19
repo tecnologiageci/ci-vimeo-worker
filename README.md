@@ -49,6 +49,24 @@ docker compose up -d
 ./run-worker.sh vps-worker
 ```
 
+## Painel e fila central
+
+O modo recomendado para varios computadores e pelo agent:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-runner\start-vimeo-agent.ps1
+```
+
+O agent conversa com o Hub em `/api/videos/workers/agent`, recebe comandos do painel `/videos/workers` e pega tarefas da fila central. Assim cada computador so processa videos reservados para ele, sem duplicar trabalho.
+
+Pelo painel da para iniciar, pausar, retomar e parar cada computador. Pausar termina o lote atual e nao pega novos videos. Parar interrompe o processo atual e libera as tarefas para outro worker.
+
+Perfis comuns:
+
+- PC forte RTX: `videoConcurrency=8`, `hlsConcurrency=3`, `uploadConcurrency=4`.
+- GTX medio: `videoConcurrency=2`, `hlsConcurrency=1`, `uploadConcurrency=2`.
+- CPU: `videoConcurrency=1`, `hlsConcurrency=1`, `uploadConcurrency=1`.
+
 ## Variaveis principais
 
 - `VIMEO_MIGRATION_VIDEO_CONCURRENCY`: quantos videos baixar/subir em paralelo.

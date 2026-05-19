@@ -19,6 +19,18 @@ type CommandResult = {
   error?: string
 }
 
+type QueueJob = {
+  id: string
+  title: string
+  source_payload: Record<string, any>
+}
+
+type TaskResult = {
+  id: string
+  status: 'completed' | 'failed' | 'released'
+  error?: string
+}
+
 type AgentState = {
   status: 'idle' | 'running' | 'paused' | 'stopping' | 'error'
   runName: string | null
@@ -27,6 +39,7 @@ type AgentState = {
   progressPercent: number
   lastError: string | null
   paused: boolean
+  queueMode: boolean
 }
 
 const workerName = envText('CI_VIMEO_WORKER_NAME', process.env.COMPUTERNAME || os.hostname())
@@ -50,6 +63,9 @@ const agentLog = createWriteStream(agentLogPath, { flags: 'a' })
 let child: ChildProcessWithoutNullStreams | null = null
 let childPid: number | null = null
 let pendingResults: CommandResult[] = []
+let pendingTaskResults: TaskResult[] = []
+let activeTaskIds: string[] = []
+let queueConfig: Record<string, any> = {}
 const state: AgentState = {
   status: 'idle',
   runName: null,
@@ -58,6 +74,7 @@ const state: AgentState = {
   progressPercent: 0,
   lastError: null,
   paused: false,
+  queueMode: false,
 }
 
 function envText(name: string, fallback = '') {
@@ -197,6 +214,139 @@ function buildStartCommand(payload: Record<string, any>) {
   return { command: 'npm', args: ['run', 'video:migrate-vimeo'], env, runName }
 }
 
+function buildQueueBatchCommand(jobs: QueueJob[], payload: Record<string, any>) {
+  const runName = String(payload.runName || payload.run_name || 'fila-central').trim()
+  const videoConcurrency = Math.max(1, numberArg(payload.videoConcurrency ?? payload.video_concurrency, 1))
+  const hlsConcurrency = Math.max(1, numberArg(payload.hlsConcurrency ?? payload.hls_concurrency, 1))
+  const uploadConcurrency = Math.max(1, numberArg(payload.uploadConcurrency ?? payload.upload_concurrency, 1))
+  const notify = boolArg(payload.notify, false)
+  const gpu = boolArg(payload.gpu, machineType.includes('gtx') || machineType.includes('rtx'))
+  const batchId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const queueFilePath = path.join(dataDir, `queue-batch-${sanitizeFileName(workerName)}-${batchId}.json`)
+  const taskIds = jobs.map((job) => job.id)
+  writeFileSync(queueFilePath, JSON.stringify({ items: jobs.map((job) => job.source_payload) }, null, 2))
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CI_VIMEO_WORKER_NAME: workerName,
+    VIMEO_MIGRATION_RUN_NAME: runName,
+    VIMEO_MIGRATION_EXECUTE: '1',
+    VIMEO_MIGRATION_NOTIFY: notify ? '1' : '0',
+    VIMEO_MIGRATION_NOTIFY_NAME: workerName,
+    VIMEO_MIGRATION_QUEUE_CACHE: '0',
+    VIMEO_MIGRATION_QUEUE_FILE: queueFilePath,
+    VIMEO_MIGRATION_QUEUE_TASK_IDS: JSON.stringify(taskIds),
+    VIMEO_MIGRATION_PROCESS: '1',
+    VIMEO_MIGRATION_VIDEO_CONCURRENCY: String(videoConcurrency),
+    VIMEO_MIGRATION_HLS_CONCURRENCY: String(hlsConcurrency),
+    VIDEO_HLS_UPLOAD_CONCURRENCY: String(uploadConcurrency),
+  }
+  if (gpu) env.VIDEO_HLS_ENCODER = 'h264_nvenc'
+
+  return {
+    command: os.platform() === 'win32' ? 'npm.cmd' : 'npm',
+    args: ['run', 'migrate'],
+    env,
+    runName,
+    queueFilePath,
+    taskIds,
+  }
+}
+
+function startQueueMode(commandId: string, payload: Record<string, any>) {
+  if (child) {
+    pendingResults.push({ id: commandId, status: 'failed', error: 'Worker já está rodando.' })
+    return
+  }
+  if (!existsSync('.env.local') && !existsSync('.env')) {
+    pendingResults.push({ id: commandId, status: 'failed', error: 'Arquivo .env.local não encontrado.' })
+    return
+  }
+
+  queueConfig = { ...payload, queueMode: true }
+  state.queueMode = true
+  state.paused = false
+  state.status = 'running'
+  state.runName = String(payload.runName || payload.run_name || 'fila-central').trim()
+  state.currentStage = 'aguardando tarefa da fila'
+  state.currentVideo = null
+  state.progressPercent = 0
+  state.lastError = null
+  pendingResults.push({ id: commandId, status: 'completed' })
+}
+
+function startQueueBatch(jobs: QueueJob[]) {
+  if (child || jobs.length === 0) return
+  const start = buildQueueBatchCommand(jobs, queueConfig)
+  activeTaskIds = start.taskIds
+  state.status = 'running'
+  state.currentStage = `lote com ${jobs.length} video(s)`
+  state.currentVideo = jobs.map((job) => job.title).join(', ').slice(0, 220)
+  state.progressPercent = 1
+  state.lastError = null
+
+  const runLogPath = path.join(logDir, `queue-${sanitizeFileName(workerName)}-${Date.now()}.log`)
+  const runLog = createWriteStream(runLogPath, { flags: 'a' })
+  log(`iniciando lote da fila: ${jobs.length} tarefas`)
+
+  child = spawn(start.command, start.args, {
+    cwd: process.cwd(),
+    env: start.env,
+    detached: os.platform() !== 'win32',
+  })
+  childPid = child.pid || null
+
+  child.stdout.on('data', (chunk) => {
+    const text = chunk.toString()
+    runLog.write(text)
+    for (const line of text.split(/\r?\n/)) parseOutputLine(line)
+  })
+
+  child.stderr.on('data', (chunk) => {
+    const text = chunk.toString()
+    runLog.write(text)
+    const line = text.trim()
+    if (line) state.lastError = line.slice(0, 500)
+  })
+
+  child.on('error', (error) => {
+    state.status = 'error'
+    state.lastError = error.message
+    pendingTaskResults.push(...activeTaskIds.map((id) => ({ id, status: 'released' as const, error: error.message })))
+    activeTaskIds = []
+    log(`erro ao iniciar lote da fila: ${error.message}`)
+  })
+
+  child.on('close', (code) => {
+    runLog.end()
+    log(`lote da fila terminou com codigo ${code}`)
+    const finishedIds = activeTaskIds
+    activeTaskIds = []
+    child = null
+    childPid = null
+
+    if (state.status === 'stopping') {
+      pendingTaskResults.push(...finishedIds.map((id) => ({ id, status: 'released' as const, error: 'Worker parado manualmente.' })))
+      state.queueMode = false
+      state.status = state.paused ? 'paused' : 'idle'
+      state.currentStage = 'parado'
+      return
+    }
+
+    if (code === 0) {
+      pendingTaskResults.push(...finishedIds.map((id) => ({ id, status: 'completed' as const })))
+      state.status = state.paused ? 'paused' : 'running'
+      state.currentStage = state.paused ? 'pausado apos lote' : 'aguardando proximo lote'
+      state.progressPercent = state.paused ? state.progressPercent : 0
+      return
+    }
+
+    pendingTaskResults.push(...finishedIds.map((id) => ({ id, status: 'released' as const, error: `Processo terminou com código ${code}` })))
+    state.status = 'error'
+    state.lastError = `Processo terminou com código ${code}`
+  })
+}
+
 function startMigration(commandId: string, payload: Record<string, any>) {
   if (child) {
     pendingResults.push({ id: commandId, status: 'failed', error: 'Worker já está rodando.' })
@@ -273,6 +423,11 @@ function startMigration(commandId: string, payload: Record<string, any>) {
 
 function stopMigration(commandId: string) {
   if (!child || !childPid) {
+    if (activeTaskIds.length > 0) {
+      pendingTaskResults.push(...activeTaskIds.map((id) => ({ id, status: 'released' as const, error: 'Worker parado manualmente.' })))
+      activeTaskIds = []
+    }
+    state.queueMode = false
     state.status = state.paused ? 'paused' : 'idle'
     pendingResults.push({ id: commandId, status: 'completed' })
     return
@@ -296,7 +451,12 @@ function stopMigration(commandId: string) {
 function handleCommand(command: WorkerCommand) {
   log(`comando recebido: ${command.command} (${command.id})`)
   if (command.command === 'start') {
-    startMigration(command.id, command.payload || {})
+    const payload = command.payload || {}
+    if (payload.queueMode === false || payload.queue_mode === false) {
+      startMigration(command.id, payload)
+    } else {
+      startQueueMode(command.id, payload)
+    }
     return
   }
   if (command.command === 'stop') {
@@ -305,17 +465,24 @@ function handleCommand(command: WorkerCommand) {
   }
   if (command.command === 'pause') {
     state.paused = true
-    if (!child) state.status = 'paused'
+    state.status = 'paused'
+    state.currentStage = child ? 'pausado apos lote atual' : 'pausado'
     pendingResults.push({ id: command.id, status: 'completed' })
     return
   }
   if (command.command === 'resume') {
     state.paused = false
-    if (!child) state.status = 'idle'
+    if (state.queueMode) {
+      state.status = 'running'
+      state.currentStage = child ? state.currentStage : 'aguardando tarefa da fila'
+    } else if (!child) {
+      state.status = 'idle'
+    }
     pendingResults.push({ id: command.id, status: 'completed' })
     return
   }
   if (command.command === 'update_config') {
+    queueConfig = { ...queueConfig, ...(command.payload || {}) }
     pendingResults.push({ id: command.id, status: 'completed' })
     return
   }
@@ -325,6 +492,8 @@ function readConfigSummary() {
   return {
     pollMs,
     hubUrl,
+    queueMode: state.queueMode,
+    queueConfig,
     notifications: process.env.VIMEO_MIGRATION_NOTIFY || null,
     encoder: process.env.VIDEO_HLS_ENCODER || null,
   }
@@ -345,6 +514,8 @@ function writeStatusFile() {
       lastError: state.lastError,
       heartbeatAt: new Date().toISOString(),
       childPid,
+      queueMode: state.queueMode,
+      activeTaskIds,
     }, null, 2))
   } catch {
     /* Nao derruba o agent por falha no arquivo de metricas. */
@@ -359,6 +530,10 @@ async function heartbeat() {
 
   const commandResults = pendingResults
   pendingResults = []
+  const taskResults = pendingTaskResults
+  pendingTaskResults = []
+  const shouldRequestJobs = state.queueMode && state.status === 'running' && !state.paused && !child
+  const capacity = Math.max(1, numberArg(queueConfig.videoConcurrency ?? queueConfig.video_concurrency, 1))
 
   const response = await fetch(`${hubUrl}/api/videos/workers/agent`, {
     method: 'POST',
@@ -385,6 +560,11 @@ async function heartbeat() {
       },
       config: readConfigSummary(),
       commandResults,
+      taskResults,
+      activeTaskIds,
+      requestJobs: shouldRequestJobs,
+      capacity,
+      leaseSeconds: 1800,
     }),
   })
 
@@ -393,6 +573,9 @@ async function heartbeat() {
 
   for (const command of (body.commands || []) as WorkerCommand[]) {
     handleCommand(command)
+  }
+  if (state.queueMode && !state.paused && !child && Array.isArray(body.jobs) && body.jobs.length > 0) {
+    startQueueBatch(body.jobs as QueueJob[])
   }
   writeStatusFile()
 }

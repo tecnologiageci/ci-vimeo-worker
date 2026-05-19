@@ -1,6 +1,6 @@
 import { config as loadEnv } from 'dotenv'
 import { createWriteStream } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import os from 'node:os'
@@ -398,6 +398,28 @@ function normalizeCachedMigrationQueue(value: unknown): MigrationVideoItem[] | n
     .filter((item: MigrationVideoItem) => item.video && (item.video.uri || item.video.link || item.video.name))
 
   return normalized.length > 0 ? normalized : null
+}
+
+async function loadInlineMigrationQueue() {
+  const inline = (process.env.VIMEO_MIGRATION_QUEUE_INLINE || '').trim()
+  if (inline) return normalizeCachedMigrationQueue(JSON.parse(inline))
+
+  const filePath = (process.env.VIMEO_MIGRATION_QUEUE_FILE || '').trim()
+  if (!filePath) return null
+  const text = await readFile(filePath, 'utf8')
+  return normalizeCachedMigrationQueue(JSON.parse(text))
+}
+
+function migrationQueueTaskIds() {
+  const raw = (process.env.VIMEO_MIGRATION_QUEUE_TASK_IDS || '').trim()
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean)
+  } catch {
+    /* aceita CSV simples abaixo */
+  }
+  return raw.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean)
 }
 
 async function loadMigrationQueueCache(bucket: string, key: string) {
@@ -930,6 +952,15 @@ async function markAssetFailed(db: any, assetId: string, message: string) {
     .eq('id', assetId)
 }
 
+async function updateMigrationQueueTask(db: any, taskId: string | null | undefined, patch: Record<string, any>) {
+  if (!db || !taskId) return
+  const { error } = await db
+    .from('video_migration_queue')
+    .update(patch)
+    .eq('id', taskId)
+  if (error) console.warn(`[queue] nao consegui atualizar task ${taskId}: ${error.message}`)
+}
+
 async function markAssetUploaded(db: any, assetId: string, sourceKey: string) {
   const { data, error } = await db
     .from('video_assets')
@@ -1015,7 +1046,15 @@ async function main() {
   }))
   const migrationQueue: MigrationVideoItem[] = []
   let loadedQueueFromCache = false
-  if (queueCacheEnabled && !refreshQueueCache) {
+  const inlineQueue = await loadInlineMigrationQueue()
+  if (inlineQueue) {
+    migrationQueue.push(...inlineQueue)
+    loadedQueueFromCache = true
+    heartbeatState.stage = 'fila recebida do controlador'
+    heartbeatState.currentTitle = `${inlineQueue.length} videos na fila controlada`
+    await notifier.send(`fila recebida do controlador: ${inlineQueue.length} videos. Vou pular o mapeamento do Vimeo.`)
+  }
+  if (!inlineQueue && queueCacheEnabled && !refreshQueueCache) {
     const cachedQueue = await loadMigrationQueueCache(r2Config.bucket, queueCacheKey)
     if (cachedQueue) {
       migrationQueue.push(...cachedQueue)
@@ -1045,6 +1084,7 @@ async function main() {
   const hlsTasks = new Set<Promise<void>>()
   const folderIdCache = new Map<string, Promise<string | null>>()
   const canCollectMore = () => limit === 0 || migrationQueue.length < limit
+  const taskIds = migrationQueueTaskIds()
 
   async function waitForHlsBacklog() {
     if (!pipelineHls || hlsBacklogLimit <= 0) return
@@ -1091,7 +1131,7 @@ async function main() {
       : `mapa inicial pronto: ${folders.length} pastas encontradas. Concorrencia: ${videoConcurrency} videos, ${processAfterUpload ? hlsConcurrency : 0} HLS. Transferencia: ${useLocalFileTransfer ? 'arquivo temporario' : 'stream direto'}.${pipelineHls ? ` Pipeline HLS ligado, backlog maximo ${hlsBacklogLimit}.` : ''}`,
   )
 
-  async function migrateVideo(video: VimeoVideo, folderPath: string[]) {
+  async function migrateVideo(video: VimeoVideo, folderPath: string[], taskId?: string | null) {
     await waitForHlsBacklog()
     if (limit > 0 && report.scanned >= limit) return
     report.scanned += 1
@@ -1101,11 +1141,25 @@ async function main() {
     heartbeatState.currentFolder = normalizeFolderPath([...rootPrefix, ...folderPath]).join('/') || 'Raiz'
     heartbeatState.stage = 'preparando video'
     heartbeatState.percent = null
+    await updateMigrationQueueTask(db, taskId, {
+      status: 'processing',
+      current_stage: 'preparando video',
+      progress_percent: 1,
+      worker_name: process.env.CI_VIMEO_WORKER_NAME || null,
+      lease_expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+    })
 
     const videoId = parseVimeoId(video.uri || video.link || '')
     if (!videoId) {
       report.failed += 1
       heartbeatState.failed = report.failed
+      await updateMigrationQueueTask(db, taskId, {
+        status: 'failed',
+        current_stage: 'erro',
+        error_message: 'Video sem ID reconhecivel.',
+        completed_at: new Date().toISOString(),
+        lease_expires_at: null,
+      })
       console.warn(`[vimeo] video sem ID reconhecivel: ${video.name || video.uri || 'sem nome'}`)
       await notifier.video(currentIndex, `encontrei um video sem ID reconhecivel e pulei: ${video.name || video.uri || 'sem nome'}.`)
       return
@@ -1125,6 +1179,13 @@ async function main() {
     if (!download) {
       report.skippedWithoutDownload += 1
       heartbeatState.skippedWithoutDownload = report.skippedWithoutDownload
+      await updateMigrationQueueTask(db, taskId, {
+        status: 'skipped',
+        current_stage: 'sem arquivo para baixar',
+        error_message: 'Vimeo nao retornou arquivo para baixar.',
+        completed_at: new Date().toISOString(),
+        lease_expires_at: null,
+      })
       console.warn(`[vimeo] sem link de arquivo: ${sourceVideo.name || videoId}`)
       await notifier.video(currentIndex, `pulei "${sourceVideo.name || videoId}" porque o Vimeo nao retornou arquivo para baixar.`)
       return
@@ -1134,6 +1195,13 @@ async function main() {
     if (!downloadUrl) {
       report.skippedWithoutDownload += 1
       heartbeatState.skippedWithoutDownload = report.skippedWithoutDownload
+      await updateMigrationQueueTask(db, taskId, {
+        status: 'skipped',
+        current_stage: 'sem URL de download',
+        error_message: 'Vimeo nao retornou URL de download.',
+        completed_at: new Date().toISOString(),
+        lease_expires_at: null,
+      })
       console.warn(`[vimeo] sem URL de download: ${sourceVideo.name || videoId}`)
       await notifier.video(currentIndex, `pulei "${sourceVideo.name || videoId}" porque o Vimeo nao retornou URL de download.`)
       return
@@ -1197,6 +1265,12 @@ async function main() {
         heartbeatState.stage = event.stage
         heartbeatState.percent = event.progress
         hlsProgress(event.progress, event.progress >= 100)
+        updateMigrationQueueTask(db, taskId, {
+          status: 'processing',
+          current_stage: event.stage,
+          progress_percent: Math.max(0, Math.min(100, event.progress)),
+          lease_expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+        }).catch(() => undefined)
       }
       const processHls = async (assetToProcess: any, sourcePath: string | null, tempDir: string | null) => {
         try {
@@ -1216,6 +1290,14 @@ async function main() {
             report.processed += 1
             heartbeatState.processed = report.processed
             heartbeatState.percent = 100
+            await updateMigrationQueueTask(db, taskId, {
+              status: 'completed',
+              current_stage: 'HLS pronto',
+              progress_percent: 100,
+              completed_at: new Date().toISOString(),
+              lease_expires_at: null,
+              result: { assetId: assetToProcess.id, videoId, hls: true },
+            })
             await notifier.video(currentIndex, `HLS pronto para "${video.name || fileName}". Vou para o proximo.`)
           }
         } catch (error) {
@@ -1225,6 +1307,14 @@ async function main() {
           const message = error instanceof Error ? error.message : String(error)
           console.error(`[erro] HLS ${video.name || videoId}: ${message}`)
           await markAssetFailed(db, assetToProcess.id, message)
+          await updateMigrationQueueTask(db, taskId, {
+            status: 'failed',
+            current_stage: 'erro no HLS',
+            error_message: message,
+            completed_at: new Date().toISOString(),
+            lease_expires_at: null,
+            result: { assetId: assetToProcess.id, videoId, hls: false },
+          })
           await notifier.send(`deu erro no HLS do video "${video.name || videoId}": ${message}`)
         } finally {
           if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
@@ -1246,6 +1336,14 @@ async function main() {
         report.duplicates += 1
         heartbeatState.duplicates = report.duplicates
         console.log(`[skip] duplicado na pasta: ${finalFolderPath.join('/') || 'Raiz'} -> ${video.name || fileName}`)
+        await updateMigrationQueueTask(db, taskId, {
+          status: 'completed',
+          current_stage: 'duplicado ja existia',
+          progress_percent: 100,
+          completed_at: new Date().toISOString(),
+          lease_expires_at: null,
+          result: { assetId: asset.id, videoId, duplicate: true },
+        })
         await notifier.video(currentIndex, `pulei duplicado: "${video.name || fileName}" ja existe em ${finalFolderPath.join('/') || 'Raiz'}.`)
         return
       }
@@ -1333,6 +1431,14 @@ async function main() {
         await withHlsSlot(() => processHls(uploaded, localSourcePath, null))
       } else {
         heartbeatState.percent = 100
+        await updateMigrationQueueTask(db, taskId, {
+          status: 'completed',
+          current_stage: 'upload concluido',
+          progress_percent: 100,
+          completed_at: new Date().toISOString(),
+          lease_expires_at: null,
+          result: { assetId: uploaded.id, videoId, hls: false },
+        })
       }
     } catch (error) {
       report.failed += 1
@@ -1341,6 +1447,14 @@ async function main() {
       const message = error instanceof Error ? error.message : String(error)
       console.error(`[erro] ${video.name || videoId}: ${message}`)
       if (assetId) await markAssetFailed(db, assetId, message)
+      await updateMigrationQueueTask(db, taskId, {
+        status: 'failed',
+        current_stage: 'erro',
+        error_message: message,
+        completed_at: new Date().toISOString(),
+        lease_expires_at: null,
+        result: { assetId, videoId },
+      })
       await notifier.send(`deu erro no video "${video.name || videoId}": ${message}`)
     } finally {
       if (localTempDir) await rm(localTempDir, { recursive: true, force: true }).catch(() => undefined)
@@ -1393,8 +1507,8 @@ async function main() {
   heartbeatState.currentFolder = rootFolderName || 'Raiz'
   console.log(`[vimeo] fila pronta: ${migrationQueue.length} videos; concorrencia videos=${videoConcurrency}; hls=${processAfterUpload ? hlsConcurrency : 0}`)
   await notifier.send(`fila pronta: ${migrationQueue.length} videos para migrar. Vou rodar ${videoConcurrency} videos em paralelo e ${processAfterUpload ? hlsConcurrency : 0} HLS em paralelo.`)
-  await runWithConcurrency(migrationQueue, videoConcurrency, async (item) => {
-    await migrateVideo(item.video, item.folderPath)
+  await runWithConcurrency(migrationQueue, videoConcurrency, async (item, index) => {
+    await migrateVideo(item.video, item.folderPath, taskIds[index] || null)
   })
   if (hlsTasks.size > 0) {
     heartbeatState.stage = `aguardando ${hlsTasks.size} HLS terminar`
