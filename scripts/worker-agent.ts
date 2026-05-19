@@ -159,6 +159,24 @@ function numberArg(value: any, fallback: number) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
+function hasRuntimeConfig() {
+  return existsSync('.env.local') ||
+    existsSync('.env') ||
+    Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.VIMEO_ACCESS_TOKEN)
+}
+
+function sanitizeChildEnv(env: NodeJS.ProcessEnv) {
+  const clean: NodeJS.ProcessEnv = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (!key || key.startsWith('=') || key.includes('=') || key.includes('\0')) continue
+    if (value == null) continue
+    const stringValue = String(value)
+    if (stringValue.includes('\0')) continue
+    clean[key] = stringValue
+  }
+  return clean
+}
+
 function buildStartCommand(payload: Record<string, any>) {
   const runName = String(payload.runName || payload.run_name || 'manual').trim()
   const folderUri = String(payload.folderUri || payload.folder_uri || '').trim()
@@ -170,11 +188,11 @@ function buildStartCommand(payload: Record<string, any>) {
   const notify = boolArg(payload.notify, true)
   const gpu = boolArg(payload.gpu, machineType.includes('gtx') || machineType.includes('rtx'))
 
-  const env: NodeJS.ProcessEnv = {
+  const env: NodeJS.ProcessEnv = sanitizeChildEnv({
     ...process.env,
     CI_VIMEO_WORKER_NAME: workerName,
     VIMEO_MIGRATION_RUN_NAME: runName,
-  }
+  })
 
   if (os.platform() === 'win32') {
     const runner = path.join(process.cwd(), 'scripts', 'run-vimeo-worker-windows.ps1')
@@ -226,7 +244,7 @@ function buildQueueBatchCommand(jobs: QueueJob[], payload: Record<string, any>) 
   const taskIds = jobs.map((job) => job.id)
   writeFileSync(queueFilePath, JSON.stringify({ items: jobs.map((job) => job.source_payload) }, null, 2))
 
-  const env: NodeJS.ProcessEnv = {
+  const env: NodeJS.ProcessEnv = sanitizeChildEnv({
     ...process.env,
     CI_VIMEO_WORKER_NAME: workerName,
     VIMEO_MIGRATION_RUN_NAME: runName,
@@ -240,7 +258,7 @@ function buildQueueBatchCommand(jobs: QueueJob[], payload: Record<string, any>) 
     VIMEO_MIGRATION_VIDEO_CONCURRENCY: String(videoConcurrency),
     VIMEO_MIGRATION_HLS_CONCURRENCY: String(hlsConcurrency),
     VIDEO_HLS_UPLOAD_CONCURRENCY: String(uploadConcurrency),
-  }
+  })
   if (gpu) env.VIDEO_HLS_ENCODER = 'h264_nvenc'
 
   return {
@@ -258,7 +276,7 @@ function startQueueMode(commandId: string, payload: Record<string, any>) {
     pendingResults.push({ id: commandId, status: 'failed', error: 'Worker já está rodando.' })
     return
   }
-  if (!existsSync('.env.local') && !existsSync('.env')) {
+  if (!hasRuntimeConfig()) {
     pendingResults.push({ id: commandId, status: 'failed', error: 'Arquivo .env.local não encontrado.' })
     return
   }
@@ -289,11 +307,24 @@ function startQueueBatch(jobs: QueueJob[]) {
   const runLog = createWriteStream(runLogPath, { flags: 'a' })
   log(`iniciando lote da fila: ${jobs.length} tarefas`)
 
-  child = spawn(start.command, start.args, {
-    cwd: process.cwd(),
-    env: start.env,
-    detached: os.platform() !== 'win32',
-  })
+  try {
+    child = spawn(start.command, start.args, {
+      cwd: process.cwd(),
+      env: start.env,
+      detached: os.platform() !== 'win32',
+    })
+  } catch (error) {
+    runLog.end()
+    const message = error instanceof Error ? error.message : String(error)
+    state.status = 'error'
+    state.lastError = message
+    pendingTaskResults.push(...activeTaskIds.map((id) => ({ id, status: 'released' as const, error: message })))
+    activeTaskIds = []
+    child = null
+    childPid = null
+    log(`erro ao iniciar lote da fila: ${message}`)
+    return
+  }
   childPid = child.pid || null
 
   child.stdout.on('data', (chunk) => {
@@ -356,7 +387,7 @@ function startMigration(commandId: string, payload: Record<string, any>) {
     pendingResults.push({ id: commandId, status: 'failed', error: 'Worker está pausado.' })
     return
   }
-  if (!existsSync('.env.local') && !existsSync('.env')) {
+  if (!hasRuntimeConfig()) {
     pendingResults.push({ id: commandId, status: 'failed', error: 'Arquivo .env.local não encontrado.' })
     return
   }
