@@ -63,17 +63,26 @@ async function getProcessCount(name: string) {
 }
 
 async function getGpuMetrics() {
-  try {
-    const { stdout } = await execFileAsync('nvidia-smi', [
-      '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total',
-      '--format=csv,noheader,nounits',
-    ], { timeout: 5000 })
-    const first = stdout.trim().split(/\r?\n/)[0]
-    const [gpu, encoder, memoryUsed, memoryTotal] = first.split(',').map((item) => Number(item.trim()))
-    return { gpu, encoder, memoryUsed, memoryTotal }
-  } catch {
-    return { gpu: 0, encoder: 0, memoryUsed: 0, memoryTotal: 0 }
+  const candidates = [process.env.NVIDIA_SMI_PATH, 'nvidia-smi'].filter(Boolean) as string[]
+  if (os.platform() === 'win32') {
+    candidates.unshift('C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe')
   }
+
+  for (const command of [...new Set(candidates)]) {
+    if (command.includes(':\\') && !existsSync(command)) continue
+    try {
+      const { stdout } = await execFileAsync(command, [
+        '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total',
+        '--format=csv,noheader,nounits',
+      ], { timeout: 5000, windowsHide: true })
+      const first = stdout.trim().split(/\r?\n/)[0]
+      const [gpu, encoder, memoryUsed, memoryTotal] = first.split(',').map((item) => Number(item.trim()))
+      return { gpu, encoder, memoryUsed, memoryTotal }
+    } catch {
+      continue
+    }
+  }
+  return { gpu: 0, encoder: 0, memoryUsed: 0, memoryTotal: 0 }
 }
 
 async function getDbCounts(runName: string) {

@@ -53,8 +53,11 @@ type SystemMetrics = {
   memoryUsedGb: number
   memoryTotalGb: number
   gpu: {
+    name: string | null
+    index: number | null
     gpuPercent: number
     encoderPercent: number | null
+    loadPercent: number
     memoryPercent: number | null
     memoryUsedMb: number | null
     memoryTotalMb: number | null
@@ -71,6 +74,7 @@ const hubUrl = envText(
 ).replace(/\/$/, '')
 const workerSecret = envText('VIDEO_WORKER_CONTROL_SECRET', envText('CRON_SECRET', ''))
 const pollMs = envNumber('CI_VIMEO_AGENT_POLL_MS', 10_000)
+const gpuMetricsCacheMs = envNumber('CI_VIMEO_GPU_METRICS_CACHE_MS', 5_000)
 const machineType = envText('CI_VIMEO_WORKER_TYPE', inferMachineType())
 const logDir = path.join(process.cwd(), 'logs')
 const agentLogPath = path.join(logDir, `agent-${sanitizeFileName(workerName)}.log`)
@@ -208,15 +212,16 @@ function parseGpuNumber(value: string) {
 }
 
 async function readGpuMetrics(): Promise<SystemMetrics['gpu']> {
-  if (Date.now() - gpuMetricsCache.at < 30_000) return gpuMetricsCache.value
+  if (Date.now() - gpuMetricsCache.at < gpuMetricsCacheMs) return gpuMetricsCache.value
 
   const queryVariants = [
     {
       args: [
-        '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total,temperature.gpu',
+        '--query-gpu=name,index,utilization.gpu,utilization.encoder,memory.used,memory.total,temperature.gpu',
         '--format=csv,noheader,nounits',
       ],
       hasEncoder: true,
+      hasName: true,
     },
     {
       args: [
@@ -224,6 +229,7 @@ async function readGpuMetrics(): Promise<SystemMetrics['gpu']> {
         '--format=csv,noheader,nounits',
       ],
       hasEncoder: false,
+      hasName: false,
     },
   ]
   for (const command of nvidiaSmiCandidates()) {
@@ -242,19 +248,25 @@ async function readGpuMetrics(): Promise<SystemMetrics['gpu']> {
         const first = output.trim().split(/\r?\n/)[0]
         if (!first) continue
         const parts = first.split(',')
-        const gpuRaw = parts[0]
-        const encoderRaw = variant.hasEncoder ? parts[1] : ''
-        const usedRaw = variant.hasEncoder ? parts[2] : parts[1]
-        const totalRaw = variant.hasEncoder ? parts[3] : parts[2]
-        const tempRaw = variant.hasEncoder ? parts[4] : parts[3]
+        const offset = variant.hasName ? 2 : 0
+        const name = variant.hasName ? String(parts[0] || '').trim() || null : null
+        const index = variant.hasName ? parseGpuNumber(parts[1] || '') : null
+        const gpuRaw = parts[offset]
+        const encoderRaw = variant.hasEncoder ? parts[offset + 1] : ''
+        const usedRaw = variant.hasEncoder ? parts[offset + 2] : parts[offset + 1]
+        const totalRaw = variant.hasEncoder ? parts[offset + 3] : parts[offset + 2]
+        const tempRaw = variant.hasEncoder ? parts[offset + 4] : parts[offset + 3]
         const gpuPercent = parseGpuNumber(gpuRaw || '')
         const encoderPercent = parseGpuNumber(encoderRaw || '')
         const memoryUsedMb = parseGpuNumber(usedRaw || '')
         const memoryTotalMb = parseGpuNumber(totalRaw || '')
         const tempC = parseGpuNumber(tempRaw || '')
         const value = gpuPercent == null ? null : {
+          name,
+          index,
           gpuPercent,
           encoderPercent,
+          loadPercent: encoderPercent ?? gpuPercent,
           memoryUsedMb,
           memoryTotalMb,
           memoryPercent: memoryUsedMb != null && memoryTotalMb ? Math.max(0, Math.min(100, (memoryUsedMb / memoryTotalMb) * 100)) : null,
