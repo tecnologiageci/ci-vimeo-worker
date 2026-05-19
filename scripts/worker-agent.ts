@@ -2,7 +2,7 @@ import { config as loadEnv } from 'dotenv'
 import { createWriteStream, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 
 loadEnv({ path: '.env.local' })
 loadEnv({ path: '.env' })
@@ -42,6 +42,27 @@ type AgentState = {
   queueMode: boolean
 }
 
+type CpuSnapshot = {
+  idle: number
+  total: number
+}
+
+type SystemMetrics = {
+  cpuPercent: number | null
+  memoryPercent: number
+  memoryUsedGb: number
+  memoryTotalGb: number
+  gpu: {
+    gpuPercent: number
+    encoderPercent: number | null
+    memoryPercent: number | null
+    memoryUsedMb: number | null
+    memoryTotalMb: number | null
+    tempC: number | null
+  } | null
+  collectedAt: string
+}
+
 const workerName = envText('CI_VIMEO_WORKER_NAME', process.env.COMPUTERNAME || os.hostname())
 const displayName = envText('CI_VIMEO_WORKER_DISPLAY_NAME', workerName)
 const hubUrl = envText(
@@ -66,6 +87,8 @@ let pendingResults: CommandResult[] = []
 let pendingTaskResults: TaskResult[] = []
 let activeTaskIds: string[] = []
 let queueConfig: Record<string, any> = {}
+let lastCpuSnapshot: CpuSnapshot | null = null
+let gpuMetricsCache: { at: number; value: SystemMetrics['gpu'] } = { at: 0, value: null }
 const state: AgentState = {
   status: 'idle',
   runName: null,
@@ -146,6 +169,102 @@ function getMachineIp() {
     }
   }
   return null
+}
+
+function readCpuSnapshot(): CpuSnapshot {
+  let idle = 0
+  let total = 0
+  for (const cpu of os.cpus()) {
+    idle += cpu.times.idle
+    total += Object.values(cpu.times).reduce((sum, value) => sum + value, 0)
+  }
+  return { idle, total }
+}
+
+function readCpuPercent() {
+  const next = readCpuSnapshot()
+  if (!lastCpuSnapshot) {
+    lastCpuSnapshot = next
+    return null
+  }
+  const idleDelta = next.idle - lastCpuSnapshot.idle
+  const totalDelta = next.total - lastCpuSnapshot.total
+  lastCpuSnapshot = next
+  if (totalDelta <= 0) return null
+  return Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100))
+}
+
+function nvidiaSmiCandidates() {
+  const candidates = [process.env.NVIDIA_SMI_PATH, 'nvidia-smi'].filter(Boolean) as string[]
+  if (os.platform() === 'win32') {
+    candidates.unshift('C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe')
+  }
+  return [...new Set(candidates)]
+}
+
+function parseGpuNumber(value: string) {
+  const parsed = Number(value.trim())
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+async function readGpuMetrics(): Promise<SystemMetrics['gpu']> {
+  if (Date.now() - gpuMetricsCache.at < 30_000) return gpuMetricsCache.value
+
+  const args = [
+    '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total,temperature.gpu',
+    '--format=csv,noheader,nounits',
+  ]
+  for (const command of nvidiaSmiCandidates()) {
+    if (command.includes(':\\') && !existsSync(command)) continue
+    try {
+      const output = await new Promise<string>((resolve, reject) => {
+        execFile(command, args, { timeout: 4000, windowsHide: true }, (error, stdout) => {
+          if (error) {
+            reject(error)
+            return
+          }
+          resolve(stdout)
+        })
+      })
+      const first = output.trim().split(/\r?\n/)[0]
+      if (!first) continue
+      const [gpuRaw, encoderRaw, usedRaw, totalRaw, tempRaw] = first.split(',')
+      const gpuPercent = parseGpuNumber(gpuRaw || '')
+      const encoderPercent = parseGpuNumber(encoderRaw || '')
+      const memoryUsedMb = parseGpuNumber(usedRaw || '')
+      const memoryTotalMb = parseGpuNumber(totalRaw || '')
+      const tempC = parseGpuNumber(tempRaw || '')
+      const value = gpuPercent == null ? null : {
+        gpuPercent,
+        encoderPercent,
+        memoryUsedMb,
+        memoryTotalMb,
+        memoryPercent: memoryUsedMb != null && memoryTotalMb ? Math.max(0, Math.min(100, (memoryUsedMb / memoryTotalMb) * 100)) : null,
+        tempC,
+      }
+      gpuMetricsCache = { at: Date.now(), value }
+      return value
+    } catch {
+      continue
+    }
+  }
+
+  gpuMetricsCache = { at: Date.now(), value: null }
+  return null
+}
+
+async function collectSystemMetrics(): Promise<SystemMetrics> {
+  const totalMemory = os.totalmem()
+  const freeMemory = os.freemem()
+  const usedMemory = Math.max(0, totalMemory - freeMemory)
+  return {
+    cpuPercent: readCpuPercent(),
+    memoryPercent: totalMemory > 0 ? Math.max(0, Math.min(100, (usedMemory / totalMemory) * 100)) : 0,
+    memoryUsedGb: usedMemory / 1024 / 1024 / 1024,
+    memoryTotalGb: totalMemory / 1024 / 1024 / 1024,
+    gpu: await readGpuMetrics(),
+    collectedAt: new Date().toISOString(),
+  }
 }
 
 function boolArg(value: any, fallback = false) {
@@ -567,6 +686,7 @@ async function heartbeat() {
   pendingTaskResults = []
   const shouldRequestJobs = state.queueMode && state.status === 'running' && !state.paused && !child
   const capacity = Math.max(1, numberArg(queueConfig.videoConcurrency ?? queueConfig.video_concurrency, 1))
+  const systemMetrics = await collectSystemMetrics()
 
   const response = await fetch(`${hubUrl}/api/videos/workers/agent`, {
     method: 'POST',
@@ -590,6 +710,7 @@ async function heartbeat() {
         arch: os.arch(),
         cpus: os.cpus().length,
         hostname: os.hostname(),
+        system: systemMetrics,
       },
       config: readConfigSummary(),
       commandResults,
