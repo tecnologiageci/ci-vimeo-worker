@@ -7,9 +7,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "migrate": "node -r tsconfig-paths/register node_modules/.bin/jiti scripts/migrate-vimeo-to-r2.ts",
-    "agent": "node -r tsconfig-paths/register node_modules/.bin/jiti scripts/worker-agent.ts",
-    "metrics": "node -r tsconfig-paths/register node_modules/.bin/jiti scripts/metrics-exporter.ts",
+    "migrate": "node -r tsconfig-paths/register node_modules/jiti/lib/jiti-cli.mjs scripts/migrate-vimeo-to-r2.ts",
+    "agent": "node -r tsconfig-paths/register node_modules/jiti/lib/jiti-cli.mjs scripts/worker-agent.ts",
+    "metrics": "node -r tsconfig-paths/register node_modules/jiti/lib/jiti-cli.mjs scripts/metrics-exporter.ts",
     "video:migrate-vimeo": "npm run migrate",
     "typecheck": "tsc --noEmit",
     "smoke": "node -e \"console.log('worker ok')\""
