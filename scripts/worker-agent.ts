@@ -261,9 +261,11 @@ function buildQueueBatchCommand(jobs: QueueJob[], payload: Record<string, any>) 
   })
   if (gpu) env.VIDEO_HLS_ENCODER = 'h264_nvenc'
 
+  const isWindows = os.platform() === 'win32'
+
   return {
-    command: os.platform() === 'win32' ? 'npm.cmd' : 'npm',
-    args: ['run', 'migrate'],
+    command: isWindows ? 'cmd.exe' : 'npm',
+    args: isWindows ? ['/c', 'npm.cmd', 'run', 'migrate'] : ['run', 'migrate'],
     env,
     runName,
     queueFilePath,
