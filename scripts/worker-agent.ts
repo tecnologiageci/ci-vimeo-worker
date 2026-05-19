@@ -210,42 +210,61 @@ function parseGpuNumber(value: string) {
 async function readGpuMetrics(): Promise<SystemMetrics['gpu']> {
   if (Date.now() - gpuMetricsCache.at < 30_000) return gpuMetricsCache.value
 
-  const args = [
-    '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total,temperature.gpu',
-    '--format=csv,noheader,nounits',
+  const queryVariants = [
+    {
+      args: [
+        '--query-gpu=utilization.gpu,utilization.encoder,memory.used,memory.total,temperature.gpu',
+        '--format=csv,noheader,nounits',
+      ],
+      hasEncoder: true,
+    },
+    {
+      args: [
+        '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
+        '--format=csv,noheader,nounits',
+      ],
+      hasEncoder: false,
+    },
   ]
   for (const command of nvidiaSmiCandidates()) {
     if (command.includes(':\\') && !existsSync(command)) continue
-    try {
-      const output = await new Promise<string>((resolve, reject) => {
-        execFile(command, args, { timeout: 4000, windowsHide: true }, (error, stdout) => {
-          if (error) {
-            reject(error)
-            return
-          }
-          resolve(stdout)
+    for (const variant of queryVariants) {
+      try {
+        const output = await new Promise<string>((resolve, reject) => {
+          execFile(command, variant.args, { timeout: 4000, windowsHide: true }, (error, stdout) => {
+            if (error) {
+              reject(error)
+              return
+            }
+            resolve(stdout)
+          })
         })
-      })
-      const first = output.trim().split(/\r?\n/)[0]
-      if (!first) continue
-      const [gpuRaw, encoderRaw, usedRaw, totalRaw, tempRaw] = first.split(',')
-      const gpuPercent = parseGpuNumber(gpuRaw || '')
-      const encoderPercent = parseGpuNumber(encoderRaw || '')
-      const memoryUsedMb = parseGpuNumber(usedRaw || '')
-      const memoryTotalMb = parseGpuNumber(totalRaw || '')
-      const tempC = parseGpuNumber(tempRaw || '')
-      const value = gpuPercent == null ? null : {
-        gpuPercent,
-        encoderPercent,
-        memoryUsedMb,
-        memoryTotalMb,
-        memoryPercent: memoryUsedMb != null && memoryTotalMb ? Math.max(0, Math.min(100, (memoryUsedMb / memoryTotalMb) * 100)) : null,
-        tempC,
+        const first = output.trim().split(/\r?\n/)[0]
+        if (!first) continue
+        const parts = first.split(',')
+        const gpuRaw = parts[0]
+        const encoderRaw = variant.hasEncoder ? parts[1] : ''
+        const usedRaw = variant.hasEncoder ? parts[2] : parts[1]
+        const totalRaw = variant.hasEncoder ? parts[3] : parts[2]
+        const tempRaw = variant.hasEncoder ? parts[4] : parts[3]
+        const gpuPercent = parseGpuNumber(gpuRaw || '')
+        const encoderPercent = parseGpuNumber(encoderRaw || '')
+        const memoryUsedMb = parseGpuNumber(usedRaw || '')
+        const memoryTotalMb = parseGpuNumber(totalRaw || '')
+        const tempC = parseGpuNumber(tempRaw || '')
+        const value = gpuPercent == null ? null : {
+          gpuPercent,
+          encoderPercent,
+          memoryUsedMb,
+          memoryTotalMb,
+          memoryPercent: memoryUsedMb != null && memoryTotalMb ? Math.max(0, Math.min(100, (memoryUsedMb / memoryTotalMb) * 100)) : null,
+          tempC,
+        }
+        gpuMetricsCache = { at: Date.now(), value }
+        return value
+      } catch {
+        continue
       }
-      gpuMetricsCache = { at: Date.now(), value }
-      return value
-    } catch {
-      continue
     }
   }
 
