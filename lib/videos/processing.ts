@@ -10,6 +10,7 @@ import {
   uploadFileToR2,
   writeJsonMetadata,
 } from './r2'
+import { buildStoryboardPlan, type StoryboardPlan } from './storyboard'
 import type { VideoAsset } from './types'
 
 interface RunResult {
@@ -142,10 +143,11 @@ async function updateJob(jobId: string, patch: Record<string, unknown>) {
   await db.from('video_processing_jobs').update(patch).eq('id', jobId)
 }
 
-async function updateAsset(assetId: string, patch: Record<string, unknown>) {
+async function updateAsset(assetId: string, patch: Record<string, unknown>, options?: { ignoreError?: boolean }) {
   const db = createSupabaseAdmin()
   if (!db) return
-  await db.from('video_assets').update(patch).eq('id', assetId)
+  const { error } = await db.from('video_assets').update(patch).eq('id', assetId)
+  if (error && !options?.ignoreError) throw error
 }
 
 async function listFilesRecursive(dir: string): Promise<string[]> {
@@ -198,6 +200,31 @@ async function generatePoster(sourcePath: string, posterPath: string) {
   }
 }
 
+async function generateStoryboard(sourcePath: string, storyboardPath: string, plan: StoryboardPlan) {
+  try {
+    const filter = [
+      `fps=1/${plan.intervalSeconds}`,
+      `scale=${plan.frameWidth}:${plan.frameHeight}:force_original_aspect_ratio=decrease`,
+      `pad=${plan.frameWidth}:${plan.frameHeight}:(ow-iw)/2:(oh-ih)/2`,
+      `tile=${plan.columns}x${plan.rows}`,
+    ].join(',')
+
+    await runCommand('ffmpeg', [
+      '-y',
+      '-i', sourcePath,
+      '-an',
+      '-vf', filter,
+      '-frames:v', '1',
+      '-q:v', '70',
+      storyboardPath,
+    ])
+    return existsSync(storyboardPath)
+  } catch (error) {
+    console.warn('[videos] geração de storyboard falhou:', error instanceof Error ? error.message : error)
+    return false
+  }
+}
+
 async function mapWithConcurrency<T>(
   items: T[],
   concurrency: number,
@@ -238,6 +265,7 @@ export async function processVideoToHls(args: {
   const outputPrefix = video.hls_prefix || `videos/${video.id}/hls`
   const manifestKey = `${outputPrefix}/index.m3u8`
   const posterKey = `${outputPrefix}/poster.jpg`
+  const storyboardKey = `${outputPrefix}/storyboard.webp`
   const metadataKey = `${outputPrefix}/metadata.json`
   const bucket = video.source_bucket || null
   let tempDir: string | null = null
@@ -266,6 +294,7 @@ export async function processVideoToHls(args: {
     const sourcePath = args.localSourcePath || path.join(tempDir, path.basename(video.source_key))
     const hlsDir = path.join(tempDir, 'hls')
     const posterPath = path.join(tempDir, 'poster.jpg')
+    const storyboardPath = path.join(tempDir, 'storyboard.webp')
 
     if (args.localSourcePath) {
       await updateJob(args.jobId, { progress: 18 })
@@ -280,6 +309,17 @@ export async function processVideoToHls(args: {
     await notifyProgress('lendo metadados', 22)
     const metadata = await readMediaMetadata(sourcePath)
     const posterCreated = await generatePoster(sourcePath, posterPath)
+    const storyboardPlan = buildStoryboardPlan({
+      durationSeconds: metadata.duration_seconds,
+      width: metadata.width,
+      height: metadata.height,
+      maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
+      frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
+      columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
+    })
+    const storyboardCreated = storyboardPlan
+      ? await generateStoryboard(sourcePath, storyboardPath, storyboardPlan)
+      : false
 
     await updateJob(args.jobId, { progress: 36 })
     await notifyProgress('convertendo para HLS', 36)
@@ -311,6 +351,11 @@ export async function processVideoToHls(args: {
       await uploadFileToR2(posterPath, posterKey, 'image/jpeg', bucket)
       finalPosterKey = posterKey
     }
+    let finalStoryboardKey: string | null = null
+    if (storyboardCreated && storyboardPlan) {
+      await uploadFileToR2(storyboardPath, storyboardKey, 'image/webp', bucket)
+      finalStoryboardKey = storyboardKey
+    }
     await notifyProgress('finalizando HLS', 96)
 
     await writeJsonMetadata(metadataKey, {
@@ -319,6 +364,8 @@ export async function processVideoToHls(args: {
       sourceKey: video.source_key,
       manifestKey,
       posterKey: finalPosterKey,
+      storyboardKey: finalStoryboardKey,
+      storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
       processedAt: new Date().toISOString(),
       ...metadata,
     }, bucket)
@@ -342,6 +389,15 @@ export async function processVideoToHls(args: {
       last_error: null,
       updated_by: args.userId,
     })
+    await updateAsset(video.id, {
+      storyboard_key: finalStoryboardKey,
+      storyboard_interval_seconds: storyboardPlan?.intervalSeconds || null,
+      storyboard_columns: storyboardPlan?.columns || null,
+      storyboard_rows: storyboardPlan?.rows || null,
+      storyboard_frame_width: storyboardPlan?.frameWidth || null,
+      storyboard_frame_height: storyboardPlan?.frameHeight || null,
+      storyboard_frame_count: storyboardPlan?.frameCount || null,
+    }, { ignoreError: true })
 
     return { manifestKey, posterKey: finalPosterKey, metadata }
   } catch (error) {

@@ -13,6 +13,13 @@ export interface VideoAsset {
   hls_prefix: string | null
   hls_manifest_key: string | null
   poster_key: string | null
+  storyboard_key?: string | null
+  storyboard_interval_seconds?: number | null
+  storyboard_columns?: number | null
+  storyboard_rows?: number | null
+  storyboard_frame_width?: number | null
+  storyboard_frame_height?: number | null
+  storyboard_frame_count?: number | null
   captions_key: string | null
   duration_seconds: number | null
   width: number | null
