@@ -61,6 +61,21 @@ O agent conversa com o Hub em `/api/videos/workers/agent`, recebe comandos do pa
 
 Pelo painel da para iniciar, pausar, retomar e parar cada computador. Pausar termina o lote atual e nao pega novos videos. Parar interrompe o processo atual e libera as tarefas para outro worker.
 
+## Processamento HLS dos uploads do Hub
+
+Uploads feitos pelo painel do Hub entram na tabela `video_processing_jobs`. Para deixar a VPS apenas como painel/orquestradora, rode este worker no computador secundario:
+
+```powershell
+$env:VIDEO_PROCESSING_WORKER_NAME = "PC-LUIZ-RTX"
+$env:VIDEO_PROCESSING_WORKER_DISPLAY_NAME = "Luiz RTX"
+$env:VIDEO_PROCESSING_WORKER_IP = "10.13.136.117"
+$env:VIDEO_PROCESSING_WORKER_CONCURRENCY = "1"
+$env:VIDEO_HLS_ENCODER = "h264_nvenc"
+npm run video:process-worker
+```
+
+Esse modo pega jobs `queued`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
+
 Perfis comuns:
 
 - PC forte RTX: `videoConcurrency=8`, `hlsConcurrency=3`, `uploadConcurrency=4`.
