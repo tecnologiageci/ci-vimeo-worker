@@ -76,6 +76,12 @@ npm run video:process-worker
 
 Esse modo pega jobs `queued`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
 
+Para registrar como tarefa do Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -Gpu
+```
+
 Perfis comuns:
 
 - PC forte RTX: `videoConcurrency=8`, `hlsConcurrency=3`, `uploadConcurrency=4`.
