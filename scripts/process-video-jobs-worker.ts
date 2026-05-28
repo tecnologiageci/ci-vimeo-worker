@@ -39,9 +39,11 @@ const queueLabel = envText(
   queueName === 'legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
 )
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
+const heartbeatMs = envNumber('VIDEO_PROCESSING_HEARTBEAT_MS', 15_000)
 const concurrency = Math.max(1, Math.min(4, envNumber('VIDEO_PROCESSING_WORKER_CONCURRENCY', 1)))
-const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 180)
-const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', false)
+const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 45)
+const jobStallMinutes = envNumber('VIDEO_PROCESSING_JOB_STALL_MINUTES', 90)
+const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', true)
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
 
 async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
@@ -128,26 +130,94 @@ async function processJob(db: any, job: ProcessingJob) {
 
   const title = asset?.title || job.video_asset_id
   console.log(`[${workerName}] processando ${title} (${job.id})`)
-  await updateHeartbeat(db, {
-    status: 'running',
-    current_stage: 'convertendo para HLS',
-    current_video: title,
-    progress_percent: 1,
-  })
+  let currentStage = 'convertendo para HLS'
+  let currentProgress = 1
+  let lastProgressAt = Date.now()
+  let exitingForStall = false
 
-  await processVideoToHls({
-    assetId: job.video_asset_id,
-    jobId: job.id,
-    userId: null,
-    onProgress: async (event) => {
+  const heartbeatTimer = setInterval(() => {
+    void (async () => {
       await updateHeartbeat(db, {
         status: 'running',
-        current_stage: event.stage,
+        current_stage: currentStage,
         current_video: title,
-        progress_percent: event.progress,
+        progress_percent: currentProgress,
       })
-    },
+
+      await db
+        .from('video_processing_jobs')
+        .update({
+          progress: currentProgress,
+          processing_worker_name: workerName,
+        })
+        .eq('id', job.id)
+        .eq('status', 'processing')
+    })().catch(() => undefined)
+  }, heartbeatMs)
+
+  const stallTimer = setInterval(() => {
+    if (Date.now() - lastProgressAt < jobStallMinutes * 60_000) return
+    if (exitingForStall) return
+    exitingForStall = true
+
+    const message = `Worker reiniciado automaticamente: sem progresso por ${jobStallMinutes} minutos em "${currentStage}".`
+    console.error(`[${workerName}] ${message}`)
+    Promise.allSettled([
+      db
+        .from('video_processing_jobs')
+        .update({
+          status: queueStatus,
+          progress: 0,
+          processing_worker_name: null,
+          error_message: message,
+        })
+        .eq('id', job.id)
+        .eq('status', 'processing')
+        .eq('queue_name', queueName),
+      updateHeartbeat(db, {
+        status: 'error',
+        current_stage: 'reiniciando worker travado',
+        current_video: title,
+        progress_percent: currentProgress,
+        last_error: message,
+      }),
+    ]).finally(() => process.exit(2))
+  }, Math.max(heartbeatMs, 30_000))
+
+  const clearTimers = () => {
+    clearInterval(heartbeatTimer)
+    clearInterval(stallTimer)
+  }
+
+  await updateHeartbeat(db, {
+    status: 'running',
+    current_stage: currentStage,
+    current_video: title,
+    progress_percent: currentProgress,
   })
+
+  try {
+    await processVideoToHls({
+      assetId: job.video_asset_id,
+      jobId: job.id,
+      userId: null,
+      onProgress: async (event) => {
+        if (event.progress !== currentProgress || event.stage !== currentStage) {
+          lastProgressAt = Date.now()
+        }
+        currentStage = event.stage
+        currentProgress = event.progress
+        await updateHeartbeat(db, {
+          status: 'running',
+          current_stage: currentStage,
+          current_video: title,
+          progress_percent: currentProgress,
+        })
+      },
+    })
+  } finally {
+    clearTimers()
+  }
 
   console.log(`[${workerName}] concluido ${title} (${job.id})`)
 }
@@ -186,7 +256,10 @@ async function main() {
     queueLabel,
     concurrency,
     pollMs,
+    heartbeatMs,
     encoder: process.env.VIDEO_HLS_ENCODER || 'libx264',
+    staleMinutes,
+    jobStallMinutes,
     requeueStale,
     once,
   }))

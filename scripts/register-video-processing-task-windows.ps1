@@ -9,20 +9,26 @@ param(
   [string]$QueueLabel = "uploads novos HLS",
   [int]$Concurrency = 1,
   [int]$PollMs = 15000,
-  [switch]$Gpu
+  [int]$HeartbeatMs = 15000,
+  [int]$StaleMinutes = 45,
+  [int]$JobStallMinutes = 90,
+  [int]$RestartDelaySeconds = 20,
+  [switch]$Gpu,
+  [switch]$AutoPull
 )
 
 $ErrorActionPreference = "Stop"
 
-$RunScript = Join-Path $InstallPath "scripts\run-video-processing-worker-windows.ps1"
-if (-not (Test-Path $RunScript)) {
-  throw "Script nao encontrado: $RunScript"
+$SupervisorScript = Join-Path $InstallPath "scripts\supervise-video-processing-worker-windows.ps1"
+if (-not (Test-Path $SupervisorScript)) {
+  throw "Script nao encontrado: $SupervisorScript"
 }
 
 $Arguments = @(
   "-NoProfile",
   "-ExecutionPolicy", "Bypass",
-  "-File", "`"$RunScript`"",
+  "-WindowStyle", "Hidden",
+  "-File", "`"$SupervisorScript`"",
   "-WorkerName", "`"$WorkerName`"",
   "-DisplayName", "`"$DisplayName`"",
   "-WorkerIp", "`"$WorkerIp`"",
@@ -30,18 +36,38 @@ $Arguments = @(
   "-QueueStatus", "`"$QueueStatus`"",
   "-QueueLabel", "`"$QueueLabel`"",
   "-Concurrency", "$Concurrency",
-  "-PollMs", "$PollMs"
+  "-PollMs", "$PollMs",
+  "-HeartbeatMs", "$HeartbeatMs",
+  "-StaleMinutes", "$StaleMinutes",
+  "-JobStallMinutes", "$JobStallMinutes",
+  "-RestartDelaySeconds", "$RestartDelaySeconds"
 )
 
 if ($Gpu) {
   $Arguments += "-Gpu"
 }
 
-$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ($Arguments -join " ") -WorkingDirectory $InstallPath
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+if ($AutoPull) {
+  $Arguments += "-AutoPull"
+}
 
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Force | Out-Null
+$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ($Arguments -join " ") -WorkingDirectory $InstallPath
+$Triggers = @(
+  (New-ScheduledTaskTrigger -AtLogOn),
+  (New-ScheduledTaskTrigger -AtStartup)
+)
+$CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
+$Settings = New-ScheduledTaskSettingsSet `
+  -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable `
+  -RestartCount 999 `
+  -RestartInterval (New-TimeSpan -Minutes 1) `
+  -MultipleInstances IgnoreNew `
+  -ExecutionTimeLimit (New-TimeSpan -Days 0)
+
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Triggers -Principal $Principal -Settings $Settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 3
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State

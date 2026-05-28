@@ -7,6 +7,9 @@ param(
   [string]$QueueLabel = "uploads novos HLS",
   [int]$Concurrency = 1,
   [int]$PollMs = 15000,
+  [int]$HeartbeatMs = 15000,
+  [int]$StaleMinutes = 45,
+  [int]$JobStallMinutes = 90,
   [switch]$Gpu,
   [switch]$Once
 )
@@ -27,6 +30,10 @@ $env:VIDEO_PROCESSING_QUEUE_STATUS = $QueueStatus
 $env:VIDEO_PROCESSING_QUEUE_LABEL = $QueueLabel
 $env:VIDEO_PROCESSING_WORKER_CONCURRENCY = "$Concurrency"
 $env:VIDEO_PROCESSING_WORKER_POLL_MS = "$PollMs"
+$env:VIDEO_PROCESSING_HEARTBEAT_MS = "$HeartbeatMs"
+$env:VIDEO_PROCESSING_STALE_MINUTES = "$StaleMinutes"
+$env:VIDEO_PROCESSING_JOB_STALL_MINUTES = "$JobStallMinutes"
+$env:VIDEO_PROCESSING_REQUEUE_STALE = "1"
 $env:VIDEO_HLS_UPLOAD_CONCURRENCY = if ($env:VIDEO_HLS_UPLOAD_CONCURRENCY) { $env:VIDEO_HLS_UPLOAD_CONCURRENCY } else { "4" }
 if ($Once) {
   $env:VIDEO_PROCESSING_WORKER_ONCE = "1"
@@ -47,7 +54,7 @@ if ($Gpu) {
 Write-Host "Worker: $WorkerName ($DisplayName)"
 Write-Host "Queue: $env:VIDEO_PROCESSING_QUEUE_NAME / $QueueStatus ($QueueLabel)"
 Write-Host "Repo: $RepoRoot"
-Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Encoder: $env:VIDEO_HLS_ENCODER"
+Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $HeartbeatMs ms | Stale: $StaleMinutes min | Stall: $JobStallMinutes min | Encoder: $env:VIDEO_HLS_ENCODER"
 
 Start-Transcript -Path $LogFile -Append | Out-Null
 try {

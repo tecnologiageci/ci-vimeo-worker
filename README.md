@@ -78,19 +78,21 @@ npm run video:process-worker
 ```
 
 Esse modo pega jobs da fila `uploads`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
-Jobs antigos ficam separados na fila `legacy`, com outro worker. Jobs antigos em `processing` nao sao reabertos automaticamente; use `VIDEO_PROCESSING_REQUEUE_STALE=1` somente quando quiser recuperar uma fila travada de proposito.
+Jobs antigos ficam separados na fila `legacy`, com outro worker. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
 
-Para registrar como tarefa do Windows:
+Para registrar como tarefa do Windows sem depender de CMD aberto:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -QueueName "uploads" -QueueStatus "queued" -Gpu
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -QueueName "uploads" -QueueStatus "queued" -StaleMinutes 45 -JobStallMinutes 90 -Gpu
 ```
 
 Para registrar a fila antiga/reprocessamento:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -TaskName "CI Video Processing Luiz Old" -WorkerName "PC-LUIZ-HLS-OLD" -QueueName "legacy" -QueueStatus "queued_legacy" -QueueLabel "fila antiga HLS" -Gpu
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -TaskName "CI Video Processing Luiz Old" -WorkerName "PC-LUIZ-HLS-OLD" -QueueName "legacy" -QueueStatus "queued_legacy" -QueueLabel "fila antiga HLS" -StaleMinutes 45 -JobStallMinutes 90 -Gpu
 ```
+
+Essas tarefas usam `supervise-video-processing-worker-windows.ps1`, ficam ocultas no Agendador de Tarefas, sobem no logon/startup e reiniciam o worker sempre que o Node/ffmpeg cair. O proprio worker tambem manda heartbeat periodico durante o processamento; se ficar sem progresso pelo limite configurado, ele devolve o job para a fila e encerra para o supervisor subir de novo.
 
 Perfis comuns:
 
