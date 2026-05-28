@@ -69,18 +69,26 @@ Uploads feitos pelo painel do Hub entram na tabela `video_processing_jobs`. Para
 $env:VIDEO_PROCESSING_WORKER_NAME = "PC-LUIZ-HLS"
 $env:VIDEO_PROCESSING_WORKER_DISPLAY_NAME = "Luiz RTX"
 $env:VIDEO_PROCESSING_WORKER_IP = "10.13.136.117"
+$env:VIDEO_PROCESSING_QUEUE_STATUS = "queued"
+$env:VIDEO_PROCESSING_QUEUE_LABEL = "uploads novos HLS"
 $env:VIDEO_PROCESSING_WORKER_CONCURRENCY = "1"
 $env:VIDEO_HLS_ENCODER = "h264_nvenc"
 npm run video:process-worker
 ```
 
 Esse modo pega jobs `queued`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
-Jobs antigos em `processing` nao sao reabertos automaticamente; use `VIDEO_PROCESSING_REQUEUE_STALE=1` somente quando quiser recuperar uma fila travada de proposito.
+Jobs antigos ficam separados em `queued_legacy`, com outro worker. Jobs antigos em `processing` nao sao reabertos automaticamente; use `VIDEO_PROCESSING_REQUEUE_STALE=1` somente quando quiser recuperar uma fila travada de proposito.
 
 Para registrar como tarefa do Windows:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -Gpu
+```
+
+Para registrar a fila antiga/reprocessamento:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -TaskName "CI Video Processing Luiz Old" -WorkerName "PC-LUIZ-HLS-OLD" -QueueStatus "queued_legacy" -QueueLabel "fila antiga HLS" -Gpu
 ```
 
 Perfis comuns:

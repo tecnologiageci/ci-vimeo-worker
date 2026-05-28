@@ -4,6 +4,8 @@ param(
   [string]$WorkerName = "PC-LUIZ-HLS",
   [string]$DisplayName = "Luiz RTX",
   [string]$WorkerIp = "10.13.136.117",
+  [string]$QueueStatus = "queued",
+  [string]$QueueLabel = "uploads novos HLS",
   [int]$Concurrency = 1,
   [int]$PollMs = 15000,
   [switch]$Gpu
@@ -23,6 +25,8 @@ $Arguments = @(
   "-WorkerName", "`"$WorkerName`"",
   "-DisplayName", "`"$DisplayName`"",
   "-WorkerIp", "`"$WorkerIp`"",
+  "-QueueStatus", "`"$QueueStatus`"",
+  "-QueueLabel", "`"$QueueLabel`"",
   "-Concurrency", "$Concurrency",
   "-PollMs", "$PollMs"
 )

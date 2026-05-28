@@ -24,9 +24,19 @@ function envFlag(name: string, fallback = false) {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
 }
 
+function envText(name: string, fallback: string) {
+  const value = process.env[name]
+  return value == null || value.trim() === '' ? fallback : value.trim()
+}
+
 const workerName = (process.env.VIDEO_PROCESSING_WORKER_NAME || 'PC-LUIZ-HLS').trim()
 const displayName = (process.env.VIDEO_PROCESSING_WORKER_DISPLAY_NAME || process.env.CI_VIMEO_WORKER_DISPLAY_NAME || 'Luiz RTX').trim()
 const machineIp = (process.env.VIDEO_PROCESSING_WORKER_IP || '10.13.136.117').trim()
+const queueStatus = envText('VIDEO_PROCESSING_QUEUE_STATUS', 'queued')
+const queueLabel = envText(
+  'VIDEO_PROCESSING_QUEUE_LABEL',
+  queueStatus === 'queued_legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
+)
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
 const concurrency = Math.max(1, Math.min(4, envNumber('VIDEO_PROCESSING_WORKER_CONCURRENCY', 1)))
 const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 180)
@@ -50,6 +60,8 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
     },
     config: {
       role: 'secondary-video-processing-server',
+      queueStatus,
+      queueLabel,
       concurrency,
       encoder: process.env.VIDEO_HLS_ENCODER || null,
     },
@@ -64,7 +76,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
     await db
       .from('video_processing_jobs')
       .update({
-        status: 'queued',
+        status: queueStatus,
         progress: 0,
         error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
       })
@@ -75,7 +87,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
     .select('id, video_asset_id, source_key, status, created_at')
-    .eq('status', 'queued')
+    .eq('status', queueStatus)
     .order('created_at', { ascending: true })
     .limit(5)
 
@@ -90,7 +102,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
         error_message: null,
       })
       .eq('id', candidate.id)
-      .eq('status', 'queued')
+      .eq('status', queueStatus)
       .select('id, video_asset_id, source_key, status')
       .maybeSingle()
 
@@ -163,6 +175,8 @@ async function main() {
     workerName,
     displayName,
     machineIp,
+    queueStatus,
+    queueLabel,
     concurrency,
     pollMs,
     encoder: process.env.VIDEO_HLS_ENCODER || 'libx264',
@@ -173,7 +187,7 @@ async function main() {
   while (true) {
     await updateHeartbeat(db, {
       status: 'running',
-      current_stage: 'procurando jobs HLS',
+      current_stage: `procurando jobs: ${queueLabel}`,
       progress_percent: 0,
     })
 
@@ -181,7 +195,7 @@ async function main() {
 
     await updateHeartbeat(db, {
       status: 'idle',
-      current_stage: 'sem jobs HLS na fila',
+      current_stage: `sem jobs: ${queueLabel}`,
       progress_percent: 0,
     })
 
