@@ -58,7 +58,7 @@ Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $Heartbeat
 
 Start-Transcript -Path $LogFile -Append | Out-Null
 try {
-  npm run video:process-worker
+  & npm.cmd run video:process-worker
   exit $LASTEXITCODE
 } finally {
   Stop-Transcript | Out-Null
