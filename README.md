@@ -75,6 +75,7 @@ npm run video:process-worker
 ```
 
 Esse modo pega jobs `queued`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
+Jobs antigos em `processing` nao sao reabertos automaticamente; use `VIDEO_PROCESSING_REQUEUE_STALE=1` somente quando quiser recuperar uma fila travada de proposito.
 
 Para registrar como tarefa do Windows:
 

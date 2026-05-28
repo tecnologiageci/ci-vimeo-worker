@@ -30,6 +30,7 @@ const machineIp = (process.env.VIDEO_PROCESSING_WORKER_IP || '10.13.136.117').tr
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
 const concurrency = Math.max(1, Math.min(4, envNumber('VIDEO_PROCESSING_WORKER_CONCURRENCY', 1)))
 const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 180)
+const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', false)
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
 
 async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
@@ -58,16 +59,18 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
 }
 
 async function claimNextJob(db: any): Promise<ProcessingJob | null> {
-  const staleBefore = new Date(Date.now() - staleMinutes * 60_000).toISOString()
-  await db
-    .from('video_processing_jobs')
-    .update({
-      status: 'queued',
-      progress: 0,
-      error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
-    })
-    .eq('status', 'processing')
-    .lt('updated_at', staleBefore)
+  if (requeueStale) {
+    const staleBefore = new Date(Date.now() - staleMinutes * 60_000).toISOString()
+    await db
+      .from('video_processing_jobs')
+      .update({
+        status: 'queued',
+        progress: 0,
+        error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
+      })
+      .eq('status', 'processing')
+      .lt('updated_at', staleBefore)
+  }
 
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
@@ -163,6 +166,7 @@ async function main() {
     concurrency,
     pollMs,
     encoder: process.env.VIDEO_HLS_ENCODER || 'libx264',
+    requeueStale,
     once,
   }))
 
