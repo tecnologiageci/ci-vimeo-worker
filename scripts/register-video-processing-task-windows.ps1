@@ -1,7 +1,7 @@
 param(
   [string]$InstallPath = "C:\ci-vimeo-agent",
   [string]$TaskName = "CI Video Processing Luiz",
-  [string]$WorkerName = "PC-LUIZ-RTX",
+  [string]$WorkerName = "PC-LUIZ-HLS",
   [string]$DisplayName = "Luiz RTX",
   [string]$WorkerIp = "10.13.136.117",
   [int]$Concurrency = 1,

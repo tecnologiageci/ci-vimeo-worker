@@ -24,7 +24,7 @@ function envFlag(name: string, fallback = false) {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
 }
 
-const workerName = (process.env.VIDEO_PROCESSING_WORKER_NAME || process.env.CI_VIMEO_WORKER_NAME || 'PC-LUIZ-RTX').trim()
+const workerName = (process.env.VIDEO_PROCESSING_WORKER_NAME || 'PC-LUIZ-HLS').trim()
 const displayName = (process.env.VIDEO_PROCESSING_WORKER_DISPLAY_NAME || process.env.CI_VIMEO_WORKER_DISPLAY_NAME || 'Luiz RTX').trim()
 const machineIp = (process.env.VIDEO_PROCESSING_WORKER_IP || '10.13.136.117').trim()
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)

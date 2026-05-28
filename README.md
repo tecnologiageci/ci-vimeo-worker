@@ -66,7 +66,7 @@ Pelo painel da para iniciar, pausar, retomar e parar cada computador. Pausar ter
 Uploads feitos pelo painel do Hub entram na tabela `video_processing_jobs`. Para deixar a VPS apenas como painel/orquestradora, rode este worker no computador secundario:
 
 ```powershell
-$env:VIDEO_PROCESSING_WORKER_NAME = "PC-LUIZ-RTX"
+$env:VIDEO_PROCESSING_WORKER_NAME = "PC-LUIZ-HLS"
 $env:VIDEO_PROCESSING_WORKER_DISPLAY_NAME = "Luiz RTX"
 $env:VIDEO_PROCESSING_WORKER_IP = "10.13.136.117"
 $env:VIDEO_PROCESSING_WORKER_CONCURRENCY = "1"
