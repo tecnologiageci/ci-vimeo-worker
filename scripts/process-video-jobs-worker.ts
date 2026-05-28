@@ -33,9 +33,10 @@ const workerName = (process.env.VIDEO_PROCESSING_WORKER_NAME || 'PC-LUIZ-HLS').t
 const displayName = (process.env.VIDEO_PROCESSING_WORKER_DISPLAY_NAME || process.env.CI_VIMEO_WORKER_DISPLAY_NAME || 'Luiz RTX').trim()
 const machineIp = (process.env.VIDEO_PROCESSING_WORKER_IP || '10.13.136.117').trim()
 const queueStatus = envText('VIDEO_PROCESSING_QUEUE_STATUS', 'queued')
+const queueName = envText('VIDEO_PROCESSING_QUEUE_NAME', queueStatus === 'queued_legacy' ? 'legacy' : 'uploads')
 const queueLabel = envText(
   'VIDEO_PROCESSING_QUEUE_LABEL',
-  queueStatus === 'queued_legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
+  queueName === 'legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
 )
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
 const concurrency = Math.max(1, Math.min(4, envNumber('VIDEO_PROCESSING_WORKER_CONCURRENCY', 1)))
@@ -60,6 +61,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
     },
     config: {
       role: 'secondary-video-processing-server',
+      queueName,
       queueStatus,
       queueLabel,
       concurrency,
@@ -81,13 +83,15 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
         error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
       })
       .eq('status', 'processing')
+      .eq('queue_name', queueName)
       .lt('updated_at', staleBefore)
   }
 
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
-    .select('id, video_asset_id, source_key, status, created_at')
+    .select('id, video_asset_id, source_key, status, created_at, queue_name')
     .eq('status', queueStatus)
+    .eq('queue_name', queueName)
     .order('created_at', { ascending: true })
     .limit(5)
 
@@ -98,11 +102,13 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
       .from('video_processing_jobs')
       .update({
         status: 'processing',
+        processing_worker_name: workerName,
         started_at: new Date().toISOString(),
         error_message: null,
       })
       .eq('id', candidate.id)
       .eq('status', queueStatus)
+      .eq('queue_name', queueName)
       .select('id, video_asset_id, source_key, status')
       .maybeSingle()
 
@@ -175,6 +181,7 @@ async function main() {
     workerName,
     displayName,
     machineIp,
+    queueName,
     queueStatus,
     queueLabel,
     concurrency,

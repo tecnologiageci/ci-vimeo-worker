@@ -2,6 +2,7 @@ param(
   [string]$WorkerName = "PC-LUIZ-HLS",
   [string]$DisplayName = "Luiz RTX",
   [string]$WorkerIp = "10.13.136.117",
+  [string]$QueueName = "",
   [string]$QueueStatus = "queued",
   [string]$QueueLabel = "uploads novos HLS",
   [int]$Concurrency = 1,
@@ -21,6 +22,7 @@ $LogFile = Join-Path $LogDir "video-processing-$WorkerName.log"
 $env:VIDEO_PROCESSING_WORKER_NAME = $WorkerName
 $env:VIDEO_PROCESSING_WORKER_DISPLAY_NAME = $DisplayName
 $env:VIDEO_PROCESSING_WORKER_IP = $WorkerIp
+$env:VIDEO_PROCESSING_QUEUE_NAME = if ($QueueName) { $QueueName } elseif ($QueueStatus -eq "queued_legacy") { "legacy" } else { "uploads" }
 $env:VIDEO_PROCESSING_QUEUE_STATUS = $QueueStatus
 $env:VIDEO_PROCESSING_QUEUE_LABEL = $QueueLabel
 $env:VIDEO_PROCESSING_WORKER_CONCURRENCY = "$Concurrency"
@@ -43,7 +45,7 @@ if ($Gpu) {
 }
 
 Write-Host "Worker: $WorkerName ($DisplayName)"
-Write-Host "Queue: $QueueStatus ($QueueLabel)"
+Write-Host "Queue: $env:VIDEO_PROCESSING_QUEUE_NAME / $QueueStatus ($QueueLabel)"
 Write-Host "Repo: $RepoRoot"
 Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Encoder: $env:VIDEO_HLS_ENCODER"
 
