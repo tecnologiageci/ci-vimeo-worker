@@ -5,13 +5,55 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Test-PythonInvoker {
+  param(
+    [string]$Command,
+    [string[]]$VersionArguments = @("--version")
+  )
+
+  try {
+    & $Command @VersionArguments *> $null
+    return $LASTEXITCODE -eq 0
+  } catch {
+    return $false
+  }
+}
+
+function Test-PythonAvailable {
+  if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonInvoker -Command "python")) {
+    return $true
+  }
+
+  if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonInvoker -Command "py" -VersionArguments @("-3.11", "--version"))) {
+    return $true
+  }
+
+  $Candidates = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+    "C:\Program Files\Python311\python.exe",
+    "C:\Python311\python.exe"
+  )
+
+  foreach ($Candidate in $Candidates) {
+    if ((Test-Path $Candidate) -and (Test-PythonInvoker -Command $Candidate)) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
 function Ensure-Command {
   param(
     [string]$Name,
     [string]$WingetId
   )
 
-  if (Get-Command $Name -ErrorAction SilentlyContinue) {
+  if ($Name -eq "python" -and (Test-PythonAvailable)) {
+    return
+  }
+
+  if ($Name -ne "python" -and (Get-Command $Name -ErrorAction SilentlyContinue)) {
     return
   }
 
@@ -25,12 +67,12 @@ function Ensure-Command {
 function Invoke-BasePython {
   param([string[]]$Arguments)
 
-  if (Get-Command python -ErrorAction SilentlyContinue) {
+  if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonInvoker -Command "python")) {
     & python @Arguments
     return
   }
 
-  if (Get-Command py -ErrorAction SilentlyContinue) {
+  if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonInvoker -Command "py" -VersionArguments @("-3.11", "--version"))) {
     & py -3.11 @Arguments
     return
   }
