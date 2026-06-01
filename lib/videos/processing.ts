@@ -242,6 +242,11 @@ async function mapWithConcurrency<T>(
   }))
 }
 
+function localSourceExtension(sourceKey: string) {
+  const extension = path.extname(path.basename(sourceKey)).toLowerCase()
+  return /^\.[a-z0-9]{2,8}$/.test(extension) ? extension : '.mp4'
+}
+
 export async function processVideoToHls(args: {
   assetId: string
   jobId: string
@@ -291,7 +296,7 @@ export async function processVideoToHls(args: {
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-'))
-    const sourcePath = args.localSourcePath || path.join(tempDir, path.basename(video.source_key))
+    const sourcePath = args.localSourcePath || path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
     const hlsDir = path.join(tempDir, 'hls')
     const posterPath = path.join(tempDir, 'poster.jpg')
     const storyboardPath = path.join(tempDir, 'storyboard.webp')
