@@ -38,7 +38,7 @@ $env:VIDEO_HLS_UPLOAD_CONCURRENCY = if ($env:VIDEO_HLS_UPLOAD_CONCURRENCY) { $en
 $env:VIDEO_CAPTIONS_ENABLED = if ($env:VIDEO_CAPTIONS_ENABLED) {
   $env:VIDEO_CAPTIONS_ENABLED
 } else {
-  "1"
+  "0"
 }
 $DefaultCaptionsPython = Join-Path $RepoRoot ".venv-captions\Scripts\python.exe"
 if (-not $env:VIDEO_CAPTIONS_PYTHON -and (Test-Path $DefaultCaptionsPython)) {

@@ -667,7 +667,8 @@ export async function processVideoToHls(args: {
 
     let primaryCaptionsKey: string | null = null
     let captionTracks: StoredCaptionTrack[] = []
-    if (envFlag('VIDEO_CAPTIONS_ENABLED', true)) {
+    const captionsEnabled = envFlag('VIDEO_CAPTIONS_ENABLED', false)
+    if (captionsEnabled) {
       await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
       await notifyProgress('Extraindo áudio da legenda', 0)
 
@@ -686,7 +687,7 @@ export async function processVideoToHls(args: {
       await notifyProgress('Legendas enviadas para R2', 100)
     }
 
-    await notifyProgress('Legendas concluídas', 100)
+    await notifyProgress(captionsEnabled ? 'Legendas concluídas' : 'Vídeo pronto; legendas ficam para depois', 100)
 
     await writeJsonMetadata(metadataKey, {
       assetId: video.id,

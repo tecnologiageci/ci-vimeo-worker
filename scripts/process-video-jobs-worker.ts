@@ -77,7 +77,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
     capabilities: {
       hlsProcessor: true,
       externalVideoProcessing: true,
-      captions: envFlag('VIDEO_CAPTIONS_ENABLED', true),
+      captions: envFlag('VIDEO_CAPTIONS_ENABLED', false),
       gpu: true,
     },
     config: {
@@ -87,7 +87,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
       queueLabel,
       concurrency,
       encoder: process.env.VIDEO_HLS_ENCODER || null,
-      captionsEnabled: envFlag('VIDEO_CAPTIONS_ENABLED', true),
+      captionsEnabled: envFlag('VIDEO_CAPTIONS_ENABLED', false),
       captionsModel: process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
       captionsDevice: process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
       captionsTranslate: process.env.VIDEO_CAPTIONS_TRANSLATE !== '0',
