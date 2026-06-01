@@ -22,6 +22,35 @@ function Ensure-Command {
   winget install --id $WingetId --silent --accept-package-agreements --accept-source-agreements
 }
 
+function Invoke-BasePython {
+  param([string[]]$Arguments)
+
+  if (Get-Command python -ErrorAction SilentlyContinue) {
+    & python @Arguments
+    return
+  }
+
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    & py -3.11 @Arguments
+    return
+  }
+
+  $Candidates = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+    "C:\Program Files\Python311\python.exe",
+    "C:\Python311\python.exe"
+  )
+
+  foreach ($Candidate in $Candidates) {
+    if (Test-Path $Candidate) {
+      & $Candidate @Arguments
+      return
+    }
+  }
+
+  throw "Python 3.11 nao encontrado apos instalacao."
+}
+
 $RepoRoot = $InstallPath
 $Requirements = Join-Path $RepoRoot "requirements-video-captions.txt"
 $Venv = Join-Path $RepoRoot ".venv-captions"
@@ -35,7 +64,7 @@ Ensure-Command -Name "python" -WingetId "Python.Python.3.11"
 
 Set-Location $RepoRoot
 if (-not (Test-Path $Python)) {
-  python -m venv $Venv
+  Invoke-BasePython -Arguments @("-m", "venv", $Venv)
 }
 
 & $Python -m pip install --upgrade pip setuptools wheel
