@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -48,6 +49,33 @@ def write_vtt(path, cues):
         lines.append(text)
         lines.append("")
     Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def prepare_audio_source(source_path, output_dir):
+    audio_path = Path(output_dir) / "caption-audio.wav"
+    emit_progress("extraindo audio para legendas", 1)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(audio_path),
+        ],
+        check=True,
+    )
+    return str(audio_path)
 
 
 def transcribe(source_path, model_name, device, compute_type, language):
@@ -190,7 +218,7 @@ def main():
     if not args.source:
         raise SystemExit("--source e obrigatorio fora do warmup.")
 
-    source_path = str(Path(args.source))
+    source_path = prepare_audio_source(str(Path(args.source)), output_dir)
     pt_path = output_dir / TRACKS["pt-BR"]["file"]
     en_path = output_dir / TRACKS["en"]["file"]
     es_path = output_dir / TRACKS["es"]["file"]
