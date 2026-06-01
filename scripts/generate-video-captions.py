@@ -57,9 +57,13 @@ def transcribe(source_path, model_name, device, compute_type, language):
     requested_device = (device or "auto").strip().lower()
     if requested_device == "auto":
         attempts.append(("cuda", compute_type or "int8_float16"))
+        if (compute_type or "").strip().lower() != "int8":
+            attempts.append(("cuda", "int8"))
         attempts.append(("cpu", "int8"))
     elif requested_device == "cuda":
         attempts.append(("cuda", compute_type or "int8_float16"))
+        if (compute_type or "").strip().lower() != "int8":
+            attempts.append(("cuda", "int8"))
         attempts.append(("cpu", "int8"))
     else:
         attempts.append(("cpu", compute_type or "int8"))
