@@ -38,6 +38,73 @@ function Quote-ProcessArgument {
   return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Get-DescendantProcessIds {
+  param([int[]]$ParentIds)
+
+  $allProcesses = Get-CimInstance Win32_Process
+  $pending = @($ParentIds)
+  $descendants = @()
+
+  while ($pending.Count -gt 0) {
+    $parentId = $pending[0]
+    if ($pending.Count -gt 1) {
+      $pending = $pending[1..($pending.Count - 1)]
+    } else {
+      $pending = @()
+    }
+
+    $children = @($allProcesses | Where-Object { $_.ParentProcessId -eq $parentId })
+    foreach ($child in $children) {
+      $descendants += [int]$child.ProcessId
+      $pending += [int]$child.ProcessId
+    }
+  }
+
+  return $descendants
+}
+
+function Stop-ProcessTree {
+  param([int[]]$RootIds)
+
+  $ids = @()
+  foreach ($rootId in $RootIds) {
+    $ids += Get-DescendantProcessIds -ParentIds @($rootId)
+    $ids += $rootId
+  }
+
+  $ids = @($ids | Where-Object { $_ -and $_ -ne $PID } | Sort-Object -Unique -Descending)
+  foreach ($id in $ids) {
+    try {
+      Stop-Process -Id $id -Force -ErrorAction Stop
+      Write-SupervisorLog "Processo antigo encerrado: $id"
+    } catch {
+      Write-SupervisorLog "Nao consegui encerrar processo $id: $($_.Exception.Message)"
+    }
+  }
+}
+
+function Stop-ExistingWorkerProcesses {
+  $workerNamePattern = '(?i)-WorkerName\s+"?' + [regex]::Escape($WorkerName) + '"?(?:\s|$)'
+  $roots = @(
+    Get-CimInstance Win32_Process |
+      Where-Object {
+        $_.ProcessId -ne $PID `
+          -and $_.CommandLine `
+          -and $_.CommandLine -match $workerNamePattern `
+          -and (
+            $_.CommandLine -like "*supervise-video-processing-worker-windows.ps1*" `
+              -or $_.CommandLine -like "*run-video-processing-worker-windows.ps1*"
+          )
+      } |
+      Select-Object -ExpandProperty ProcessId
+  )
+
+  if ($roots.Count -gt 0) {
+    Write-SupervisorLog "Encerrando processos antigos de $WorkerName antes de iniciar: $($roots -join ', ')"
+    Stop-ProcessTree -RootIds $roots
+  }
+}
+
 if (-not (Test-Path $RunScript)) {
   Write-SupervisorLog "Script nao encontrado: $RunScript"
   exit 1
@@ -45,6 +112,7 @@ if (-not (Test-Path $RunScript)) {
 
 Set-Location $RepoRoot
 Write-SupervisorLog "Supervisor iniciado para $WorkerName em $RepoRoot"
+Stop-ExistingWorkerProcesses
 
 while ($true) {
   if ($AutoPull) {
