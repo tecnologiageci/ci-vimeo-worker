@@ -78,7 +78,7 @@ function Stop-ProcessTree {
       Stop-Process -Id $id -Force -ErrorAction Stop
       Write-SupervisorLog "Processo antigo encerrado: $id"
     } catch {
-      Write-SupervisorLog "Nao consegui encerrar processo $id: $($_.Exception.Message)"
+      Write-SupervisorLog "Nao consegui encerrar processo ${id}: $($_.Exception.Message)"
     }
   }
 }
