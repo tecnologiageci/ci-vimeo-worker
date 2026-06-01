@@ -78,11 +78,11 @@ npm run video:process-worker
 ```
 
 Esse modo pega jobs da fila `uploads`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
-Jobs antigos ficam separados na fila `legacy`, com outro worker. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
+Jobs antigos ficam separados na fila `legacy`, com outro worker. Quando o video antigo ja tem HLS pronto e o job vem como `captions`, o worker baixa o original e gera apenas as legendas/traducoes, sem refazer o HLS. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
 
 ### Legendas automaticas
 
-Nos uploads novos (`QueueName=uploads`), o worker tambem gera legendas WebVTT antes de marcar o video como pronto:
+Nos uploads novos (`QueueName=uploads`) e nos jobs antigos de legenda (`QueueName=legacy`, `job_type=captions`), o worker gera legendas WebVTT:
 
 - `pt-BR`: transcricao local com `faster-whisper`/Whisper.
 - `en`: traducao local com OPUS-MT/Helsinki-NLP.
@@ -108,10 +108,10 @@ Para registrar como tarefa do Windows sem depender de CMD aberto:
 powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -QueueName "uploads" -QueueStatus "queued" -StaleMinutes 45 -JobStallMinutes 90 -Gpu
 ```
 
-Para registrar a fila antiga/reprocessamento:
+Para registrar a fila antiga de legendas/reprocessamento:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -TaskName "CI Video Processing Luiz Old" -WorkerName "PC-LUIZ-HLS-OLD" -QueueName "legacy" -QueueStatus "queued_legacy" -QueueLabel "fila antiga HLS" -StaleMinutes 45 -JobStallMinutes 90 -Gpu
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\register-video-processing-task-windows.ps1 -TaskName "CI Video Processing Luiz Old" -WorkerName "PC-LUIZ-HLS-OLD" -QueueName "legacy" -QueueStatus "queued_legacy" -QueueLabel "fila antiga legendas" -StaleMinutes 45 -JobStallMinutes 90 -Gpu
 ```
 
 Essas tarefas usam `supervise-video-processing-worker-windows.ps1`, ficam ocultas no Agendador de Tarefas, sobem no logon/startup e reiniciam o worker sempre que o Node/ffmpeg cair. O proprio worker tambem manda heartbeat periodico durante o processamento; se ficar sem progresso pelo limite configurado, ele devolve o job para a fila e encerra para o supervisor subir de novo.

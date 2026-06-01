@@ -1,7 +1,7 @@
 import { config as loadEnv } from 'dotenv'
 import { setTimeout as wait } from 'node:timers/promises'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
-import { processVideoToHls } from '@/lib/videos/processing'
+import { processVideoCaptionsOnly, processVideoToHls } from '@/lib/videos/processing'
 
 loadEnv({ path: '.env.local' })
 loadEnv({ path: '.env' })
@@ -11,6 +11,7 @@ type ProcessingJob = {
   video_asset_id: string
   source_key: string | null
   status: string
+  job_type?: string | null
 }
 
 function envNumber(name: string, fallback: number) {
@@ -45,6 +46,11 @@ const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 45)
 const jobStallMinutes = envNumber('VIDEO_PROCESSING_JOB_STALL_MINUTES', 90)
 const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', true)
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
+
+function hasCaptionTracks(asset: any) {
+  return Boolean(asset?.captions_key)
+    || (Array.isArray(asset?.caption_tracks) && asset.caption_tracks.length > 0)
+}
 
 async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
   await db.from('video_migration_workers').upsert({
@@ -96,7 +102,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
 
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
-    .select('id, video_asset_id, source_key, status, created_at, queue_name')
+    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name')
     .eq('status', queueStatus)
     .eq('queue_name', queueName)
     .order('created_at', { ascending: true })
@@ -117,7 +123,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
       .eq('id', candidate.id)
       .eq('status', queueStatus)
       .eq('queue_name', queueName)
-      .select('id, video_asset_id, source_key, status')
+      .select('id, video_asset_id, source_key, status, job_type')
       .maybeSingle()
 
     if (claimError) throw claimError
@@ -130,13 +136,15 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
 async function processJob(db: any, job: ProcessingJob) {
   const { data: asset } = await db
     .from('video_assets')
-    .select('title')
+    .select('title,status,hls_manifest_key,captions_key,caption_tracks')
     .eq('id', job.video_asset_id)
     .maybeSingle()
 
   const title = asset?.title || job.video_asset_id
   console.log(`[${workerName}] processando ${title} (${job.id})`)
-  let currentStage = 'convertendo para HLS'
+  const captionsOnly = job.job_type === 'captions'
+    || (queueName === 'legacy' && asset?.hls_manifest_key && !hasCaptionTracks(asset))
+  let currentStage = captionsOnly ? 'gerando legendas pt-BR, ingles e espanhol' : 'convertendo para HLS'
   let currentProgress = 1
   let lastProgressAt = Date.now()
   let exitingForStall = false
@@ -205,7 +213,8 @@ async function processJob(db: any, job: ProcessingJob) {
   })
 
   try {
-    await processVideoToHls({
+    const processor = captionsOnly ? processVideoCaptionsOnly : processVideoToHls
+    await processor({
       assetId: job.video_asset_id,
       jobId: job.id,
       userId: null,

@@ -65,6 +65,10 @@ function captionProgress(baseProgress: number) {
   return Math.max(94, Math.min(99, Math.round(94 + (baseProgress / 100) * 5)))
 }
 
+function captionOnlyProgress(baseProgress: number) {
+  return Math.max(15, Math.min(99, Math.round(15 + (baseProgress / 100) * 84)))
+}
+
 function resolveCaptionPython() {
   return (process.env.VIDEO_CAPTIONS_PYTHON || process.env.PYTHON || 'python').trim()
 }
@@ -79,6 +83,7 @@ function runCaptionGenerator(args: {
   outputDir: string
   resultJson: string
   onProgress?: (stage: string, progress: number) => void
+  mapProgress?: (progress: number) => number
 }): Promise<{ tracks: GeneratedCaptionTrack[] }> {
   return new Promise((resolve, reject) => {
     const childArgs = [
@@ -114,7 +119,9 @@ function runCaptionGenerator(args: {
         try {
           const event = JSON.parse(line)
           if (event.type === 'progress') {
-            args.onProgress?.(String(event.stage || 'gerando legendas'), captionProgress(Number(event.progress || 0)))
+            const rawProgress = Number(event.progress || 0)
+            const progress = args.mapProgress ? args.mapProgress(rawProgress) : captionProgress(rawProgress)
+            args.onProgress?.(String(event.stage || 'gerando legendas'), progress)
           }
         } catch {
           /* stdout pode conter avisos das libs Python */
@@ -140,6 +147,50 @@ function runCaptionGenerator(args: {
       }
     })
   })
+}
+
+async function generateAndUploadCaptionTracks(args: {
+  sourcePath: string
+  tempDir: string
+  outputPrefix: string
+  bucket: string | null
+  resultDirName?: string
+  onProgress?: (stage: string, progress: number) => void | Promise<void>
+  mapProgress?: (progress: number) => number
+}) {
+  const captionsDir = path.join(args.tempDir, args.resultDirName || 'captions')
+  const captionsResultJson = path.join(captionsDir, 'captions-result.json')
+  await mkdir(captionsDir, { recursive: true })
+
+  const captionsResult = await runCaptionGenerator({
+    sourcePath: args.sourcePath,
+    outputDir: captionsDir,
+    resultJson: captionsResultJson,
+    mapProgress: args.mapProgress,
+    onProgress: (stage, progress) => {
+      Promise.resolve(args.onProgress?.(stage, progress)).catch(() => undefined)
+    },
+  })
+
+  const generatedAt = new Date().toISOString()
+  const captionTracks: StoredCaptionTrack[] = []
+  for (const track of captionsResult.tracks || []) {
+    if (!track.path || !track.language) continue
+    const fileName = path.basename(track.path)
+    const key = `${args.outputPrefix}/captions/${fileName}`
+    await uploadFileToR2(track.path, key, 'text/vtt; charset=utf-8', args.bucket)
+    captionTracks.push({
+      language: track.language,
+      label: track.label || track.language,
+      key,
+      default: Boolean(track.default),
+      source: track.source || null,
+      generated_at: generatedAt,
+    })
+  }
+
+  const primaryCaptionsKey = captionTracks.find((track) => track.language === 'pt-BR')?.key || captionTracks[0]?.key || null
+  return { captionTracks, primaryCaptionsKey }
 }
 
 function secondsFromFfmpegProgress(line: string) {
@@ -351,6 +402,120 @@ function localSourceExtension(sourceKey: string) {
   return /^\.[a-z0-9]{2,8}$/.test(extension) ? extension : '.mp4'
 }
 
+function dirnameFromR2Key(key: string | null | undefined) {
+  if (!key) return null
+  const normalized = key.replace(/\\/g, '/')
+  const index = normalized.lastIndexOf('/')
+  return index >= 0 ? normalized.slice(0, index) : normalized
+}
+
+export async function processVideoCaptionsOnly(args: {
+  assetId: string
+  jobId: string
+  userId: string | null
+  onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
+}) {
+  const db = createSupabaseAdmin()
+  if (!db) throw new Error('Supabase não configurado.')
+
+  const { data: asset, error } = await db
+    .from('video_assets')
+    .select('*')
+    .eq('id', args.assetId)
+    .single()
+
+  if (error || !asset) throw new Error(error?.message || 'Vídeo não encontrado.')
+  const video = asset as VideoAsset
+  if (!video.source_key) throw new Error('Vídeo sem arquivo original no R2.')
+  if (!video.hls_manifest_key) throw new Error('Vídeo ainda não tem HLS pronto.')
+
+  const outputPrefix = video.hls_prefix || dirnameFromR2Key(video.hls_manifest_key) || `videos/${video.id}/hls`
+  const bucket = video.source_bucket || null
+  let tempDir: string | null = null
+
+  const notifyProgress = async (stage: string, progress: number) => {
+    try {
+      await args.onProgress?.({ stage, progress })
+    } catch {
+      /* progresso externo nao deve quebrar processamento */
+    }
+  }
+
+  await updateJob(args.jobId, {
+    status: 'processing',
+    progress: 5,
+    source_key: video.source_key,
+    output_prefix: outputPrefix,
+    started_at: new Date().toISOString(),
+    current_stage: 'preparando legendas',
+    error_message: null,
+  })
+  await notifyProgress('preparando legendas', 5)
+
+  try {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-captions-'))
+    const sourcePath = path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
+
+    await updateJob(args.jobId, { progress: 12, current_stage: 'baixando original do R2' })
+    await notifyProgress('baixando original do R2', 12)
+    await downloadObjectToFile(video.source_key, sourcePath, bucket)
+
+    await updateJob(args.jobId, { progress: 15, current_stage: 'gerando legendas pt-BR, ingles e espanhol' })
+    await notifyProgress('gerando legendas pt-BR, ingles e espanhol', 15)
+    const { captionTracks, primaryCaptionsKey } = await generateAndUploadCaptionTracks({
+      sourcePath,
+      tempDir,
+      outputPrefix,
+      bucket,
+      resultDirName: 'captions-only',
+      mapProgress: captionOnlyProgress,
+      onProgress: (stage, progress) => {
+        notifyProgress(stage, progress).catch(() => undefined)
+      },
+    })
+
+    if (captionTracks.length === 0 || !primaryCaptionsKey) {
+      throw new Error('Nenhuma legenda foi gerada.')
+    }
+
+    await notifyProgress('legendas enviadas para R2', 99)
+    await updateAsset(video.id, {
+      captions_key: primaryCaptionsKey,
+      caption_tracks: captionTracks,
+      last_error: null,
+      updated_by: args.userId,
+    })
+
+    await updateJob(args.jobId, {
+      status: 'completed',
+      progress: 100,
+      completed_at: new Date().toISOString(),
+      current_stage: 'legendas concluidas',
+    })
+    await notifyProgress('legendas concluidas', 100)
+
+    return { captionTracks }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await updateJob(args.jobId, {
+      status: 'failed',
+      progress: 100,
+      error_message: message,
+      completed_at: new Date().toISOString(),
+      current_stage: 'erro nas legendas',
+    })
+    await updateAsset(video.id, {
+      last_error: message,
+      updated_by: args.userId,
+    }, { ignoreError: true })
+    throw error
+  } finally {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+}
+
 export async function processVideoToHls(args: {
   assetId: string
   jobId: string
@@ -469,37 +634,21 @@ export async function processVideoToHls(args: {
     let primaryCaptionsKey: string | null = null
     let captionTracks: StoredCaptionTrack[] = []
     if (envFlag('VIDEO_CAPTIONS_ENABLED', true)) {
-      const captionsDir = path.join(tempDir, 'captions')
-      const captionsResultJson = path.join(captionsDir, 'captions-result.json')
-      await mkdir(captionsDir, { recursive: true })
       await updateJob(args.jobId, { progress: 94 })
       await notifyProgress('gerando legendas pt-BR, ingles e espanhol', 94)
 
-      const captionsResult = await runCaptionGenerator({
+      const captionsResult = await generateAndUploadCaptionTracks({
         sourcePath,
-        outputDir: captionsDir,
-        resultJson: captionsResultJson,
+        tempDir,
+        outputPrefix,
+        bucket,
         onProgress: (stage, progress) => {
           notifyProgress(stage, progress).catch(() => undefined)
         },
       })
 
-      const generatedAt = new Date().toISOString()
-      for (const track of captionsResult.tracks || []) {
-        if (!track.path || !track.language) continue
-        const fileName = path.basename(track.path)
-        const key = `${outputPrefix}/captions/${fileName}`
-        await uploadFileToR2(track.path, key, 'text/vtt; charset=utf-8', bucket)
-        captionTracks.push({
-          language: track.language,
-          label: track.label || track.language,
-          key,
-          default: Boolean(track.default),
-          source: track.source || null,
-          generated_at: generatedAt,
-        })
-      }
-      primaryCaptionsKey = captionTracks.find((track) => track.language === 'pt-BR')?.key || captionTracks[0]?.key || null
+      captionTracks = captionsResult.captionTracks
+      primaryCaptionsKey = captionsResult.primaryCaptionsKey
       await notifyProgress('legendas enviadas para R2', 99)
     }
 
