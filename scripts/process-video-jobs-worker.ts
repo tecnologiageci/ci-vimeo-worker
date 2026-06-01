@@ -59,6 +59,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
     capabilities: {
       hlsProcessor: true,
       externalVideoProcessing: true,
+      captions: envFlag('VIDEO_CAPTIONS_ENABLED', true),
       gpu: true,
     },
     config: {
@@ -68,6 +69,9 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
       queueLabel,
       concurrency,
       encoder: process.env.VIDEO_HLS_ENCODER || null,
+      captionsEnabled: envFlag('VIDEO_CAPTIONS_ENABLED', true),
+      captionsModel: process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
+      captionsTranslate: process.env.VIDEO_CAPTIONS_TRANSLATE !== '0',
     },
     last_error: patch.last_error || patch.lastError || null,
     heartbeat_at: new Date().toISOString(),
@@ -82,6 +86,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
       .update({
         status: queueStatus,
         progress: 0,
+        current_stage: `reenfileirado por ausencia de progresso por ${staleMinutes} minutos`,
         error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
       })
       .eq('status', 'processing')
@@ -105,6 +110,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
       .update({
         status: 'processing',
         processing_worker_name: workerName,
+        current_stage: 'reservado pelo worker',
         started_at: new Date().toISOString(),
         error_message: null,
       })
@@ -148,6 +154,7 @@ async function processJob(db: any, job: ProcessingJob) {
         .from('video_processing_jobs')
         .update({
           progress: currentProgress,
+          current_stage: currentStage,
           processing_worker_name: workerName,
         })
         .eq('id', job.id)
@@ -169,6 +176,7 @@ async function processJob(db: any, job: ProcessingJob) {
           status: queueStatus,
           progress: 0,
           processing_worker_name: null,
+          current_stage: 'reenfileirado por worker travado',
           error_message: message,
         })
         .eq('id', job.id)

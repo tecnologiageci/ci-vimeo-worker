@@ -1,7 +1,7 @@
 import path from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
 import {
@@ -16,6 +16,23 @@ import type { VideoAsset } from './types'
 interface RunResult {
   stdout: string
   stderr: string
+}
+
+type GeneratedCaptionTrack = {
+  language: string
+  label: string
+  path: string
+  default?: boolean
+  source?: string | null
+}
+
+type StoredCaptionTrack = {
+  language: string
+  label: string
+  key: string
+  default: boolean
+  source?: string | null
+  generated_at: string
 }
 
 function runCommand(command: string, args: string[], cwd?: string): Promise<RunResult> {
@@ -34,6 +51,93 @@ function runCommand(command: string, args: string[], cwd?: string): Promise<RunR
     child.on('close', (code) => {
       if (code === 0) resolve({ stdout, stderr })
       else reject(new Error(`${command} saiu com código ${code}: ${stderr || stdout}`))
+    })
+  })
+}
+
+function envFlag(name: string, fallback = false) {
+  const value = (process.env[name] || '').trim().toLowerCase()
+  if (!value) return fallback
+  return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
+}
+
+function captionProgress(baseProgress: number) {
+  return Math.max(94, Math.min(99, Math.round(94 + (baseProgress / 100) * 5)))
+}
+
+function resolveCaptionPython() {
+  return (process.env.VIDEO_CAPTIONS_PYTHON || process.env.PYTHON || 'python').trim()
+}
+
+function resolveCaptionScript() {
+  const configured = process.env.VIDEO_CAPTIONS_SCRIPT?.trim()
+  return configured || path.join(process.cwd(), 'scripts', 'generate-video-captions.py')
+}
+
+function runCaptionGenerator(args: {
+  sourcePath: string
+  outputDir: string
+  resultJson: string
+  onProgress?: (stage: string, progress: number) => void
+}): Promise<{ tracks: GeneratedCaptionTrack[] }> {
+  return new Promise((resolve, reject) => {
+    const childArgs = [
+      resolveCaptionScript(),
+      '--source', args.sourcePath,
+      '--output-dir', args.outputDir,
+      '--result-json', args.resultJson,
+      '--model', process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
+      '--device', process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
+      '--compute-type', process.env.VIDEO_CAPTIONS_COMPUTE_TYPE || 'int8_float16',
+      '--language', process.env.VIDEO_CAPTIONS_SOURCE_LANGUAGE || 'pt',
+      process.env.VIDEO_CAPTIONS_TRANSLATE === '0' ? '--no-translate' : '--translate',
+      '--translation-device', process.env.VIDEO_CAPTIONS_TRANSLATION_DEVICE || 'cpu',
+      '--pt-en-model', process.env.VIDEO_CAPTIONS_PT_EN_MODEL || 'Helsinki-NLP/opus-mt-mul-en',
+      '--pt-es-model', process.env.VIDEO_CAPTIONS_PT_ES_MODEL || '',
+      '--en-es-model', process.env.VIDEO_CAPTIONS_EN_ES_MODEL || 'Helsinki-NLP/opus-mt-en-es',
+    ]
+
+    const child = spawn(resolveCaptionPython(), childArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    let progressBuffer = ''
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString()
+      stdout += text
+      progressBuffer += text
+      const lines = progressBuffer.split(/\r?\n/)
+      progressBuffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const event = JSON.parse(line)
+          if (event.type === 'progress') {
+            args.onProgress?.(String(event.stage || 'gerando legendas'), captionProgress(Number(event.progress || 0)))
+          }
+        } catch {
+          /* stdout pode conter avisos das libs Python */
+        }
+      }
+    })
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on('error', reject)
+    child.on('close', async (code) => {
+      if (code !== 0) {
+        reject(new Error(`gerador de legendas saiu com código ${code}: ${stderr || stdout}`))
+        return
+      }
+
+      try {
+        const raw = await readFile(args.resultJson, 'utf8')
+        resolve(JSON.parse(raw))
+      } catch (error) {
+        reject(new Error(`gerador de legendas nao retornou JSON valido: ${error instanceof Error ? error.message : error}`))
+      }
     })
   })
 }
@@ -361,7 +465,45 @@ export async function processVideoToHls(args: {
       await uploadFileToR2(storyboardPath, storyboardKey, 'image/webp', bucket)
       finalStoryboardKey = storyboardKey
     }
-    await notifyProgress('finalizando HLS', 96)
+
+    let primaryCaptionsKey: string | null = null
+    let captionTracks: StoredCaptionTrack[] = []
+    if (envFlag('VIDEO_CAPTIONS_ENABLED', true)) {
+      const captionsDir = path.join(tempDir, 'captions')
+      const captionsResultJson = path.join(captionsDir, 'captions-result.json')
+      await mkdir(captionsDir, { recursive: true })
+      await updateJob(args.jobId, { progress: 94 })
+      await notifyProgress('gerando legendas pt-BR, ingles e espanhol', 94)
+
+      const captionsResult = await runCaptionGenerator({
+        sourcePath,
+        outputDir: captionsDir,
+        resultJson: captionsResultJson,
+        onProgress: (stage, progress) => {
+          notifyProgress(stage, progress).catch(() => undefined)
+        },
+      })
+
+      const generatedAt = new Date().toISOString()
+      for (const track of captionsResult.tracks || []) {
+        if (!track.path || !track.language) continue
+        const fileName = path.basename(track.path)
+        const key = `${outputPrefix}/captions/${fileName}`
+        await uploadFileToR2(track.path, key, 'text/vtt; charset=utf-8', bucket)
+        captionTracks.push({
+          language: track.language,
+          label: track.label || track.language,
+          key,
+          default: Boolean(track.default),
+          source: track.source || null,
+          generated_at: generatedAt,
+        })
+      }
+      primaryCaptionsKey = captionTracks.find((track) => track.language === 'pt-BR')?.key || captionTracks[0]?.key || null
+      await notifyProgress('legendas enviadas para R2', 99)
+    }
+
+    await notifyProgress('finalizando HLS', 99)
 
     await writeJsonMetadata(metadataKey, {
       assetId: video.id,
@@ -371,6 +513,7 @@ export async function processVideoToHls(args: {
       posterKey: finalPosterKey,
       storyboardKey: finalStoryboardKey,
       storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
+      captionTracks,
       processedAt: new Date().toISOString(),
       ...metadata,
     }, bucket)
@@ -387,6 +530,10 @@ export async function processVideoToHls(args: {
       hls_prefix: outputPrefix,
       hls_manifest_key: manifestKey,
       poster_key: finalPosterKey,
+      ...(captionTracks.length > 0 ? {
+        captions_key: primaryCaptionsKey,
+        caption_tracks: captionTracks,
+      } : {}),
       duration_seconds: metadata.duration_seconds,
       width: metadata.width,
       height: metadata.height,

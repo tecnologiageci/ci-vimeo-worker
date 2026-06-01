@@ -21,6 +21,14 @@ export interface VideoAsset {
   storyboard_frame_height?: number | null
   storyboard_frame_count?: number | null
   captions_key: string | null
+  caption_tracks?: Array<{
+    language: string
+    label: string
+    key: string
+    default?: boolean
+    source?: string | null
+    generated_at?: string | null
+  }> | null
   duration_seconds: number | null
   width: number | null
   height: number | null

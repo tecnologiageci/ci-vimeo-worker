@@ -35,6 +35,25 @@ $env:VIDEO_PROCESSING_STALE_MINUTES = "$StaleMinutes"
 $env:VIDEO_PROCESSING_JOB_STALL_MINUTES = "$JobStallMinutes"
 $env:VIDEO_PROCESSING_REQUEUE_STALE = "1"
 $env:VIDEO_HLS_UPLOAD_CONCURRENCY = if ($env:VIDEO_HLS_UPLOAD_CONCURRENCY) { $env:VIDEO_HLS_UPLOAD_CONCURRENCY } else { "4" }
+$env:VIDEO_CAPTIONS_ENABLED = if ($env:VIDEO_CAPTIONS_ENABLED) {
+  $env:VIDEO_CAPTIONS_ENABLED
+} elseif ($env:VIDEO_PROCESSING_QUEUE_NAME -eq "uploads") {
+  "1"
+} else {
+  "0"
+}
+$DefaultCaptionsPython = Join-Path $RepoRoot ".venv-captions\Scripts\python.exe"
+if (-not $env:VIDEO_CAPTIONS_PYTHON -and (Test-Path $DefaultCaptionsPython)) {
+  $env:VIDEO_CAPTIONS_PYTHON = $DefaultCaptionsPython
+}
+$env:VIDEO_CAPTIONS_SCRIPT = if ($env:VIDEO_CAPTIONS_SCRIPT) { $env:VIDEO_CAPTIONS_SCRIPT } else { Join-Path $RepoRoot "scripts\generate-video-captions.py" }
+$env:VIDEO_CAPTIONS_MODEL = if ($env:VIDEO_CAPTIONS_MODEL) { $env:VIDEO_CAPTIONS_MODEL } else { "large-v3" }
+$env:VIDEO_CAPTIONS_DEVICE = if ($env:VIDEO_CAPTIONS_DEVICE) { $env:VIDEO_CAPTIONS_DEVICE } else { "cuda" }
+$env:VIDEO_CAPTIONS_COMPUTE_TYPE = if ($env:VIDEO_CAPTIONS_COMPUTE_TYPE) { $env:VIDEO_CAPTIONS_COMPUTE_TYPE } else { "int8_float16" }
+$env:VIDEO_CAPTIONS_TRANSLATE = if ($env:VIDEO_CAPTIONS_TRANSLATE) { $env:VIDEO_CAPTIONS_TRANSLATE } else { "1" }
+$env:VIDEO_CAPTIONS_TRANSLATION_DEVICE = if ($env:VIDEO_CAPTIONS_TRANSLATION_DEVICE) { $env:VIDEO_CAPTIONS_TRANSLATION_DEVICE } else { "cpu" }
+$env:VIDEO_CAPTIONS_PT_EN_MODEL = if ($env:VIDEO_CAPTIONS_PT_EN_MODEL) { $env:VIDEO_CAPTIONS_PT_EN_MODEL } else { "Helsinki-NLP/opus-mt-mul-en" }
+$env:VIDEO_CAPTIONS_EN_ES_MODEL = if ($env:VIDEO_CAPTIONS_EN_ES_MODEL) { $env:VIDEO_CAPTIONS_EN_ES_MODEL } else { "Helsinki-NLP/opus-mt-en-es" }
 if ($Once) {
   $env:VIDEO_PROCESSING_WORKER_ONCE = "1"
 }
@@ -54,7 +73,7 @@ if ($Gpu) {
 Write-Host "Worker: $WorkerName ($DisplayName)"
 Write-Host "Queue: $env:VIDEO_PROCESSING_QUEUE_NAME / $QueueStatus ($QueueLabel)"
 Write-Host "Repo: $RepoRoot"
-Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $HeartbeatMs ms | Stale: $StaleMinutes min | Stall: $JobStallMinutes min | Encoder: $env:VIDEO_HLS_ENCODER"
+Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $HeartbeatMs ms | Stale: $StaleMinutes min | Stall: $JobStallMinutes min | Encoder: $env:VIDEO_HLS_ENCODER | Captions: $env:VIDEO_CAPTIONS_ENABLED"
 
 Start-Transcript -Path $LogFile -Append | Out-Null
 try {

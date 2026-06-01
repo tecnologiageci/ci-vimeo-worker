@@ -80,6 +80,28 @@ npm run video:process-worker
 Esse modo pega jobs da fila `uploads`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
 Jobs antigos ficam separados na fila `legacy`, com outro worker. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
 
+### Legendas automaticas
+
+Nos uploads novos (`QueueName=uploads`), o worker tambem gera legendas WebVTT antes de marcar o video como pronto:
+
+- `pt-BR`: transcricao local com `faster-whisper`/Whisper.
+- `en`: traducao local com OPUS-MT/Helsinki-NLP.
+- `es`: traducao local via OPUS-MT, mantendo os mesmos timestamps.
+
+Prepare o ambiente de IA no Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\setup-video-captioning-windows.ps1 -DownloadModels
+```
+
+Variaveis uteis:
+
+- `VIDEO_CAPTIONS_ENABLED`: `1` para ligar, `0` para desligar.
+- `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
+- `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
+- `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `int8_float16`.
+- `VIDEO_CAPTIONS_TRANSLATE`: `1` para gerar ingles/espanhol, `0` para so PT-BR.
+
 Para registrar como tarefa do Windows sem depender de CMD aberto:
 
 ```powershell
