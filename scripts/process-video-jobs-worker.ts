@@ -46,10 +46,22 @@ const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 45)
 const jobStallMinutes = envNumber('VIDEO_PROCESSING_JOB_STALL_MINUTES', 90)
 const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', true)
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
+const pauseLegacyForUploads = envFlag('VIDEO_PROCESSING_PAUSE_LEGACY_FOR_UPLOADS', queueName === 'legacy')
 
 function hasCaptionTracks(asset: any) {
   return Boolean(asset?.captions_key)
     || (Array.isArray(asset?.caption_tracks) && asset.caption_tracks.length > 0)
+}
+
+async function countActiveUploadJobs(db: any) {
+  const { count, error } = await db
+    .from('video_processing_jobs')
+    .select('id', { count: 'exact', head: true })
+    .eq('queue_name', 'uploads')
+    .in('status', ['queued', 'processing'])
+
+  if (error) throw error
+  return count || 0
 }
 
 async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
@@ -79,6 +91,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
       captionsModel: process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
       captionsDevice: process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
       captionsTranslate: process.env.VIDEO_CAPTIONS_TRANSLATE !== '0',
+      pauseLegacyForUploads,
     },
     last_error: patch.last_error || patch.lastError || null,
     heartbeat_at: new Date().toISOString(),
@@ -280,9 +293,24 @@ async function main() {
     jobStallMinutes,
     requeueStale,
     once,
+    pauseLegacyForUploads,
   }))
 
   while (true) {
+    if (queueName === 'legacy' && pauseLegacyForUploads) {
+      const activeUploads = await countActiveUploadJobs(db)
+      if (activeUploads > 0) {
+        await updateHeartbeat(db, {
+          status: 'idle',
+          current_stage: `aguardando uploads novos (${activeUploads})`,
+          progress_percent: 0,
+        })
+        if (once) break
+        await wait(pollMs)
+        continue
+      }
+    }
+
     await updateHeartbeat(db, {
       status: 'running',
       current_stage: `procurando jobs: ${queueLabel}`,

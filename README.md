@@ -78,7 +78,7 @@ npm run video:process-worker
 ```
 
 Esse modo pega jobs da fila `uploads`, baixa o original do R2, gera HLS/poster/storyboard localmente e devolve tudo para o R2/Supabase.
-Jobs antigos ficam separados na fila `legacy`, com outro worker. Quando o video antigo ja tem HLS pronto e o job vem como `captions`, o worker baixa o original e gera apenas as legendas/traducoes, sem refazer o HLS. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
+Jobs antigos ficam separados na fila `legacy`, com outro worker. Quando o video antigo ja tem HLS pronto e o job vem como `captions`, o worker baixa o original e gera apenas as legendas/traducoes, sem refazer o HLS. Por padrao, o worker `legacy` aguarda enquanto houver upload novo em `queued` ou `processing`, para nao disputar GPU com videos enviados agora. O worker reenfileira automaticamente jobs antigos que ficarem presos em `processing` sem atualizacao e reinicia o processo quando passar muito tempo sem progresso.
 
 ### Legendas automaticas
 
