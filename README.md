@@ -99,7 +99,8 @@ Variaveis uteis:
 - `VIDEO_CAPTIONS_ENABLED`: `1` para ligar, `0` para desligar.
 - `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
 - `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
-- `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `int8_float16`.
+- `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `int8`, mantendo `large-v3` com menor uso de VRAM em videos longos.
+- `VIDEO_CAPTIONS_VAD_FILTER`: `1` para filtro VAD do Whisper; padrao `0` para evitar espera longa antes do primeiro progresso em aulas grandes.
 - `VIDEO_CAPTIONS_TRANSLATE`: `1` para gerar ingles/espanhol, `0` para so PT-BR.
 
 Para registrar como tarefa do Windows sem depender de CMD aberto:

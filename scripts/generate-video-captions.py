@@ -38,6 +38,13 @@ def clean_caption_text(text):
     return text.replace("-->", "->")
 
 
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
 def write_vtt(path, cues):
     lines = ["WEBVTT", ""]
     for index, cue in enumerate(cues, start=1):
@@ -78,7 +85,7 @@ def prepare_audio_source(source_path, output_dir):
     return str(audio_path)
 
 
-def transcribe(source_path, model_name, device, compute_type, language):
+def transcribe(source_path, model_name, device, compute_type, language, vad_filter):
     from faster_whisper import WhisperModel
 
     attempts = []
@@ -101,12 +108,13 @@ def transcribe(source_path, model_name, device, compute_type, language):
         try:
             emit_progress(f"carregando Whisper {model_name} ({attempt_device})", 1)
             model = WhisperModel(model_name, device=attempt_device, compute_type=attempt_compute)
+            emit_progress(f"transcrevendo legenda pt-BR ({attempt_device})", 5)
             segments, info = model.transcribe(
                 source_path,
                 language=language,
                 task="transcribe",
                 beam_size=5,
-                vad_filter=True,
+                vad_filter=vad_filter,
                 word_timestamps=False,
             )
             duration = float(getattr(info, "duration", 0.0) or 0.0)
@@ -200,6 +208,7 @@ def main():
     parser.add_argument("--device", default=os.environ.get("VIDEO_CAPTIONS_DEVICE", "cuda"))
     parser.add_argument("--compute-type", default=os.environ.get("VIDEO_CAPTIONS_COMPUTE_TYPE", "int8_float16"))
     parser.add_argument("--language", default=os.environ.get("VIDEO_CAPTIONS_SOURCE_LANGUAGE", "pt"))
+    parser.add_argument("--vad-filter", action=argparse.BooleanOptionalAction, default=env_bool("VIDEO_CAPTIONS_VAD_FILTER", False))
     parser.add_argument("--translate", action=argparse.BooleanOptionalAction, default=os.environ.get("VIDEO_CAPTIONS_TRANSLATE", "1") != "0")
     parser.add_argument("--translation-device", default=os.environ.get("VIDEO_CAPTIONS_TRANSLATION_DEVICE", "cpu"))
     parser.add_argument("--pt-en-model", default=os.environ.get("VIDEO_CAPTIONS_PT_EN_MODEL", "Helsinki-NLP/opus-mt-mul-en"))
@@ -223,7 +232,7 @@ def main():
     en_path = output_dir / TRACKS["en"]["file"]
     es_path = output_dir / TRACKS["es"]["file"]
 
-    cues_pt, transcription_info = transcribe(source_path, args.model, args.device, args.compute_type, args.language)
+    cues_pt, transcription_info = transcribe(source_path, args.model, args.device, args.compute_type, args.language, args.vad_filter)
     if not cues_pt:
         raise RuntimeError("Whisper nao retornou segmentos de legenda.")
 
