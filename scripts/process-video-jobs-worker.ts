@@ -77,6 +77,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
       encoder: process.env.VIDEO_HLS_ENCODER || null,
       captionsEnabled: envFlag('VIDEO_CAPTIONS_ENABLED', true),
       captionsModel: process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
+      captionsDevice: process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
       captionsTranslate: process.env.VIDEO_CAPTIONS_TRANSLATE !== '0',
     },
     last_error: patch.last_error || patch.lastError || null,

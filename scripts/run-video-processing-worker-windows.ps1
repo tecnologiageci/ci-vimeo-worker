@@ -46,7 +46,7 @@ if (-not $env:VIDEO_CAPTIONS_PYTHON -and (Test-Path $DefaultCaptionsPython)) {
 }
 $env:VIDEO_CAPTIONS_SCRIPT = if ($env:VIDEO_CAPTIONS_SCRIPT) { $env:VIDEO_CAPTIONS_SCRIPT } else { Join-Path $RepoRoot "scripts\generate-video-captions.py" }
 $env:VIDEO_CAPTIONS_MODEL = if ($env:VIDEO_CAPTIONS_MODEL) { $env:VIDEO_CAPTIONS_MODEL } else { "large-v3" }
-$env:VIDEO_CAPTIONS_DEVICE = if ($env:VIDEO_CAPTIONS_DEVICE) { $env:VIDEO_CAPTIONS_DEVICE } else { "cuda" }
+$env:VIDEO_CAPTIONS_DEVICE = if ($Gpu) { "cuda" } elseif ($env:VIDEO_CAPTIONS_DEVICE) { $env:VIDEO_CAPTIONS_DEVICE } else { "auto" }
 $env:VIDEO_CAPTIONS_COMPUTE_TYPE = if ($env:VIDEO_CAPTIONS_COMPUTE_TYPE) { $env:VIDEO_CAPTIONS_COMPUTE_TYPE } else { "int8_float16" }
 $env:VIDEO_CAPTIONS_TRANSLATE = if ($env:VIDEO_CAPTIONS_TRANSLATE) { $env:VIDEO_CAPTIONS_TRANSLATE } else { "1" }
 $env:VIDEO_CAPTIONS_TRANSLATION_DEVICE = if ($env:VIDEO_CAPTIONS_TRANSLATION_DEVICE) { $env:VIDEO_CAPTIONS_TRANSLATION_DEVICE } else { "cpu" }
@@ -71,7 +71,7 @@ if ($Gpu) {
 Write-Host "Worker: $WorkerName ($DisplayName)"
 Write-Host "Queue: $env:VIDEO_PROCESSING_QUEUE_NAME / $QueueStatus ($QueueLabel)"
 Write-Host "Repo: $RepoRoot"
-Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $HeartbeatMs ms | Stale: $StaleMinutes min | Stall: $JobStallMinutes min | Encoder: $env:VIDEO_HLS_ENCODER | Captions: $env:VIDEO_CAPTIONS_ENABLED"
+Write-Host "Concurrency: $Concurrency | Poll: $PollMs ms | Heartbeat: $HeartbeatMs ms | Stale: $StaleMinutes min | Stall: $JobStallMinutes min | Encoder: $env:VIDEO_HLS_ENCODER | Captions: $env:VIDEO_CAPTIONS_ENABLED | CaptionDevice: $env:VIDEO_CAPTIONS_DEVICE"
 
 Start-Transcript -Path $LogFile -Append | Out-Null
 try {
