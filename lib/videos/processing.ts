@@ -61,12 +61,49 @@ function envFlag(name: string, fallback = false) {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
 }
 
-function captionProgress(baseProgress: number) {
-  return Math.max(94, Math.min(99, Math.round(94 + (baseProgress / 100) * 5)))
+function boundedPercent(value: number) {
+  return Math.max(0, Math.min(100, Math.round(Number.isFinite(value) ? value : 0)))
 }
 
-function captionOnlyProgress(baseProgress: number) {
-  return Math.max(15, Math.min(99, Math.round(15 + (baseProgress / 100) * 84)))
+function rangedPercent(value: number, start: number, end: number) {
+  if (end <= start) return boundedPercent(value)
+  return boundedPercent(((value - start) / (end - start)) * 100)
+}
+
+function normalizeStageText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+}
+
+function mapCaptionProgress(stage: string, progress: number) {
+  const normalized = normalizeStageText(stage)
+
+  if (normalized.includes('extraindo audio')) {
+    return { stage: 'Extraindo áudio da legenda', progress: boundedPercent(progress) }
+  }
+  if (normalized.includes('carregando whisper')) {
+    return { stage: 'Carregando IA de legenda', progress: 0 }
+  }
+  if (normalized.includes('transcrevendo')) {
+    return { stage: 'Gerando legenda PT-BR', progress: rangedPercent(progress, 5, 50) }
+  }
+  if (normalized.includes('carregando traducao')) {
+    const language = normalized.includes('es') && !normalized.includes('mul-en') ? 'ES' : 'EN'
+    return { stage: `Carregando tradução ${language}`, progress: 0 }
+  }
+  if (normalized.includes('ingles')) {
+    return { stage: 'Traduzindo legenda EN', progress: rangedPercent(progress, 55, 72) }
+  }
+  if (normalized.includes('espanhol')) {
+    return { stage: 'Traduzindo legenda ES', progress: rangedPercent(progress, 74, 92) }
+  }
+  if (normalized.includes('legendas prontas')) {
+    return { stage: 'Legendas prontas', progress: 100 }
+  }
+
+  return { stage: stage || 'Gerando legendas', progress: boundedPercent(progress) }
 }
 
 function resolveCaptionPython() {
@@ -83,7 +120,6 @@ function runCaptionGenerator(args: {
   outputDir: string
   resultJson: string
   onProgress?: (stage: string, progress: number) => void
-  mapProgress?: (progress: number) => number
 }): Promise<{ tracks: GeneratedCaptionTrack[] }> {
   return new Promise((resolve, reject) => {
     const childArgs = [
@@ -120,8 +156,8 @@ function runCaptionGenerator(args: {
           const event = JSON.parse(line)
           if (event.type === 'progress') {
             const rawProgress = Number(event.progress || 0)
-            const progress = args.mapProgress ? args.mapProgress(rawProgress) : captionProgress(rawProgress)
-            args.onProgress?.(String(event.stage || 'gerando legendas'), progress)
+            const mapped = mapCaptionProgress(String(event.stage || 'gerando legendas'), rawProgress)
+            args.onProgress?.(mapped.stage, mapped.progress)
           }
         } catch {
           /* stdout pode conter avisos das libs Python */
@@ -156,7 +192,6 @@ async function generateAndUploadCaptionTracks(args: {
   bucket: string | null
   resultDirName?: string
   onProgress?: (stage: string, progress: number) => void | Promise<void>
-  mapProgress?: (progress: number) => number
 }) {
   const captionsDir = path.join(args.tempDir, args.resultDirName || 'captions')
   const captionsResultJson = path.join(captionsDir, 'captions-result.json')
@@ -166,7 +201,6 @@ async function generateAndUploadCaptionTracks(args: {
     sourcePath: args.sourcePath,
     outputDir: captionsDir,
     resultJson: captionsResultJson,
-    mapProgress: args.mapProgress,
     onProgress: (stage, progress) => {
       Promise.resolve(args.onProgress?.(stage, progress)).catch(() => undefined)
     },
@@ -252,18 +286,18 @@ function runFfmpegHls(args: {
     let stdout = ''
     let stderr = ''
     let progressBuffer = ''
-    let lastPersistedProgress = 36
+    let lastPersistedProgress = -1
     let lastPersistedAt = 0
 
     const persistProgress = (progress: number) => {
       const now = Date.now()
-      const bounded = Math.max(37, Math.min(74, Math.round(progress)))
+      const bounded = boundedPercent(progress)
       if (bounded <= lastPersistedProgress) return
       if (bounded - lastPersistedProgress < 2 && now - lastPersistedAt < 1800) return
 
       lastPersistedProgress = bounded
       lastPersistedAt = now
-      updateJob(args.jobId, { progress: bounded }).catch(() => undefined)
+      updateJob(args.jobId, { progress: bounded, current_stage: 'Convertendo vídeo HLS' }).catch(() => undefined)
       args.onProgress?.(bounded)
     }
 
@@ -277,7 +311,7 @@ function runFfmpegHls(args: {
       for (const line of lines) {
         const elapsed = secondsFromFfmpegProgress(line)
         if (elapsed == null || !args.durationSeconds) continue
-        persistProgress(36 + (elapsed / args.durationSeconds) * 38)
+        persistProgress((elapsed / args.durationSeconds) * 100)
       }
     })
 
@@ -443,32 +477,31 @@ export async function processVideoCaptionsOnly(args: {
 
   await updateJob(args.jobId, {
     status: 'processing',
-    progress: 5,
+    progress: 0,
     source_key: video.source_key,
     output_prefix: outputPrefix,
     started_at: new Date().toISOString(),
-    current_stage: 'preparando legendas',
+    current_stage: 'Preparando legendas',
     error_message: null,
   })
-  await notifyProgress('preparando legendas', 5)
+  await notifyProgress('Preparando legendas', 0)
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-captions-'))
     const sourcePath = path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
 
-    await updateJob(args.jobId, { progress: 12, current_stage: 'baixando original do R2' })
-    await notifyProgress('baixando original do R2', 12)
+    await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
+    await notifyProgress('Baixando original do R2', 0)
     await downloadObjectToFile(video.source_key, sourcePath, bucket)
 
-    await updateJob(args.jobId, { progress: 15, current_stage: 'gerando legendas pt-BR, ingles e espanhol' })
-    await notifyProgress('gerando legendas pt-BR, ingles e espanhol', 15)
+    await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
+    await notifyProgress('Extraindo áudio da legenda', 0)
     const { captionTracks, primaryCaptionsKey } = await generateAndUploadCaptionTracks({
       sourcePath,
       tempDir,
       outputPrefix,
       bucket,
       resultDirName: 'captions-only',
-      mapProgress: captionOnlyProgress,
       onProgress: (stage, progress) => {
         notifyProgress(stage, progress).catch(() => undefined)
       },
@@ -478,7 +511,7 @@ export async function processVideoCaptionsOnly(args: {
       throw new Error('Nenhuma legenda foi gerada.')
     }
 
-    await notifyProgress('legendas enviadas para R2', 99)
+    await notifyProgress('Legendas enviadas para R2', 100)
     await updateAsset(video.id, {
       captions_key: primaryCaptionsKey,
       caption_tracks: captionTracks,
@@ -490,9 +523,9 @@ export async function processVideoCaptionsOnly(args: {
       status: 'completed',
       progress: 100,
       completed_at: new Date().toISOString(),
-      current_stage: 'legendas concluidas',
+      current_stage: 'Legendas concluídas',
     })
-    await notifyProgress('legendas concluidas', 100)
+    await notifyProgress('Legendas concluídas', 100)
 
     return { captionTracks }
   } catch (error) {
@@ -555,13 +588,14 @@ export async function processVideoToHls(args: {
   await updateAsset(video.id, { status: 'processing', last_error: null, updated_by: args.userId })
   await updateJob(args.jobId, {
     status: 'processing',
-    progress: 5,
+    progress: 0,
     source_key: video.source_key,
     output_prefix: outputPrefix,
     started_at: new Date().toISOString(),
+    current_stage: 'Preparando vídeo',
     error_message: null,
   })
-  await notifyProgress('preparando', 5)
+  await notifyProgress('Preparando vídeo', 0)
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-'))
@@ -571,16 +605,16 @@ export async function processVideoToHls(args: {
     const storyboardPath = path.join(tempDir, 'storyboard.webp')
 
     if (args.localSourcePath) {
-      await updateJob(args.jobId, { progress: 18 })
-      await notifyProgress('usando original temporario', 18)
+      await updateJob(args.jobId, { progress: 100, current_stage: 'Usando original temporário' })
+      await notifyProgress('Usando original temporário', 100)
     } else {
-      await updateJob(args.jobId, { progress: 12 })
-      await notifyProgress('baixando original do R2', 12)
+      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
+      await notifyProgress('Baixando original do R2', 0)
       await downloadObjectToFile(video.source_key, sourcePath, bucket)
     }
 
-    await updateJob(args.jobId, { progress: 22 })
-    await notifyProgress('lendo metadados', 22)
+    await updateJob(args.jobId, { progress: 0, current_stage: 'Gerando preview rápido' })
+    await notifyProgress('Gerando preview rápido', 0)
     const metadata = await readMediaMetadata(sourcePath)
     const posterCreated = await generatePoster(sourcePath, posterPath)
     const storyboardPlan = buildStoryboardPlan({
@@ -595,8 +629,8 @@ export async function processVideoToHls(args: {
       ? await generateStoryboard(sourcePath, storyboardPath, storyboardPlan)
       : false
 
-    await updateJob(args.jobId, { progress: 36 })
-    await notifyProgress('convertendo para HLS', 36)
+    await updateJob(args.jobId, { progress: 0, current_stage: 'Convertendo vídeo HLS' })
+    await notifyProgress('Convertendo vídeo HLS', 0)
     await mkdir(hlsDir, { recursive: true })
     await runFfmpegHls({
       sourcePath,
@@ -604,12 +638,12 @@ export async function processVideoToHls(args: {
       durationSeconds: metadata.duration_seconds,
       jobId: args.jobId,
       onProgress: (progress) => {
-        notifyProgress('convertendo para HLS', progress).catch(() => undefined)
+        notifyProgress('Convertendo vídeo HLS', progress).catch(() => undefined)
       },
     })
 
-    await updateJob(args.jobId, { progress: 76 })
-    await notifyProgress('enviando HLS para R2', 76)
+    await updateJob(args.jobId, { progress: 0, current_stage: 'Enviando HLS para R2' })
+    await notifyProgress('Enviando HLS para R2', 0)
     const hlsFiles = await listFilesRecursive(hlsDir)
     let uploadedHlsFiles = 0
     const hlsUploadConcurrency = Math.max(1, Number(process.env.VIDEO_HLS_UPLOAD_CONCURRENCY || 4))
@@ -617,7 +651,7 @@ export async function processVideoToHls(args: {
       const relative = path.relative(hlsDir, file).split(path.sep).join('/')
       await uploadFileToR2(file, `${outputPrefix}/${relative}`, guessContentType(relative), bucket)
       uploadedHlsFiles += 1
-      await notifyProgress('enviando HLS para R2', Math.round(76 + (uploadedHlsFiles / Math.max(hlsFiles.length, 1)) * 18))
+      await notifyProgress('Enviando HLS para R2', Math.round((uploadedHlsFiles / Math.max(hlsFiles.length, 1)) * 100))
     })
 
     let finalPosterKey: string | null = null
@@ -634,8 +668,8 @@ export async function processVideoToHls(args: {
     let primaryCaptionsKey: string | null = null
     let captionTracks: StoredCaptionTrack[] = []
     if (envFlag('VIDEO_CAPTIONS_ENABLED', true)) {
-      await updateJob(args.jobId, { progress: 94 })
-      await notifyProgress('gerando legendas pt-BR, ingles e espanhol', 94)
+      await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
+      await notifyProgress('Extraindo áudio da legenda', 0)
 
       const captionsResult = await generateAndUploadCaptionTracks({
         sourcePath,
@@ -649,10 +683,10 @@ export async function processVideoToHls(args: {
 
       captionTracks = captionsResult.captionTracks
       primaryCaptionsKey = captionsResult.primaryCaptionsKey
-      await notifyProgress('legendas enviadas para R2', 99)
+      await notifyProgress('Legendas enviadas para R2', 100)
     }
 
-    await notifyProgress('finalizando HLS', 99)
+    await notifyProgress('Legendas concluídas', 100)
 
     await writeJsonMetadata(metadataKey, {
       assetId: video.id,
@@ -672,7 +706,7 @@ export async function processVideoToHls(args: {
       progress: 100,
       completed_at: new Date().toISOString(),
     })
-    await notifyProgress('concluido', 100)
+    await notifyProgress('Concluído', 100)
 
     await updateAsset(video.id, {
       status: 'ready',
