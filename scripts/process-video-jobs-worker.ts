@@ -119,7 +119,7 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
     .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name')
     .eq('status', queueStatus)
     .eq('queue_name', queueName)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit(5)
 
   if (error) throw error
