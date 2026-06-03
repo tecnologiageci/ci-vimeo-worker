@@ -157,7 +157,7 @@ async function processJob(db: any, job: ProcessingJob) {
   const title = asset?.title || job.video_asset_id
   console.log(`[${workerName}] processando ${title} (${job.id})`)
   const captionsOnly = job.job_type === 'captions'
-    || (queueName === 'legacy' && asset?.hls_manifest_key && !hasCaptionTracks(asset))
+    || (asset?.hls_manifest_key && !hasCaptionTracks(asset))
   let currentStage = captionsOnly ? 'gerando legendas pt-BR, ingles e espanhol' : 'convertendo para HLS'
   let currentProgress = 1
   let lastProgressAt = Date.now()

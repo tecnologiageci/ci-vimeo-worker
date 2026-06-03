@@ -576,6 +576,7 @@ export async function processVideoToHls(args: {
   const metadataKey = `${outputPrefix}/metadata.json`
   const bucket = video.source_bucket || null
   let tempDir: string | null = null
+  let hlsPersisted = Boolean(video.hls_manifest_key)
 
   const notifyProgress = async (stage: string, progress: number) => {
     try {
@@ -665,11 +666,47 @@ export async function processVideoToHls(args: {
       finalStoryboardKey = storyboardKey
     }
 
+    await writeJsonMetadata(metadataKey, {
+      assetId: video.id,
+      title: video.title,
+      sourceKey: video.source_key,
+      manifestKey,
+      posterKey: finalPosterKey,
+      storyboardKey: finalStoryboardKey,
+      storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
+      captionTracks: [],
+      processedAt: new Date().toISOString(),
+      ...metadata,
+    }, bucket)
+
+    await updateAsset(video.id, {
+      status: 'ready',
+      hls_prefix: outputPrefix,
+      hls_manifest_key: manifestKey,
+      poster_key: finalPosterKey,
+      duration_seconds: metadata.duration_seconds,
+      width: metadata.width,
+      height: metadata.height,
+      processed_at: new Date().toISOString(),
+      last_error: null,
+      updated_by: args.userId,
+    })
+    await updateAsset(video.id, {
+      storyboard_key: finalStoryboardKey,
+      storyboard_interval_seconds: storyboardPlan?.intervalSeconds || null,
+      storyboard_columns: storyboardPlan?.columns || null,
+      storyboard_rows: storyboardPlan?.rows || null,
+      storyboard_frame_width: storyboardPlan?.frameWidth || null,
+      storyboard_frame_height: storyboardPlan?.frameHeight || null,
+      storyboard_frame_count: storyboardPlan?.frameCount || null,
+    }, { ignoreError: true })
+    hlsPersisted = true
+
     let primaryCaptionsKey: string | null = null
     let captionTracks: StoredCaptionTrack[] = []
     const captionsEnabled = envFlag('VIDEO_CAPTIONS_ENABLED', false)
     if (captionsEnabled) {
-      await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
+      await updateJob(args.jobId, { progress: 0, current_stage: 'HLS pronto; extraindo áudio da legenda' })
       await notifyProgress('Extraindo áudio da legenda', 0)
 
       const captionsResult = await generateAndUploadCaptionTracks({
@@ -745,7 +782,7 @@ export async function processVideoToHls(args: {
       completed_at: new Date().toISOString(),
     })
     await updateAsset(video.id, {
-      status: 'failed',
+      status: hlsPersisted ? 'ready' : 'failed',
       last_error: message,
       updated_by: args.userId,
     })
