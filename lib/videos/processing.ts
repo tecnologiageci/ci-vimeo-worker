@@ -555,6 +555,18 @@ function localSourceExtension(sourceKey: string) {
   return /^\.[a-z0-9]{2,8}$/.test(extension) ? extension : '.mp4'
 }
 
+function shouldGenerateStoryboard(video: VideoAsset) {
+  if (!envFlag('VIDEO_STORYBOARD_ENABLED', true)) return false
+
+  const maxSourceMb = Number(process.env.VIDEO_STORYBOARD_MAX_SOURCE_MB || 2048)
+  const sourceSizeBytes = Number(video.source_size_bytes || 0)
+  if (Number.isFinite(maxSourceMb) && maxSourceMb > 0 && sourceSizeBytes > maxSourceMb * 1024 * 1024) {
+    return false
+  }
+
+  return true
+}
+
 function dirnameFromR2Key(key: string | null | undefined) {
   if (!key) return null
   const normalized = key.replace(/\\/g, '/')
@@ -762,14 +774,16 @@ export async function processVideoToHls(args: {
     await notifyProgress('Gerando preview rápido', 0)
     const metadata = await readMediaMetadata(sourcePath)
     const posterCreated = await generatePoster(sourcePath, posterPath)
-    const storyboardPlan = buildStoryboardPlan({
-      durationSeconds: metadata.duration_seconds,
-      width: metadata.width,
-      height: metadata.height,
-      maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
-      frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
-      columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
-    })
+    const storyboardPlan = shouldGenerateStoryboard(video)
+      ? buildStoryboardPlan({
+          durationSeconds: metadata.duration_seconds,
+          width: metadata.width,
+          height: metadata.height,
+          maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
+          frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
+          columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
+        })
+      : null
     const storyboardCreated = storyboardPlan
       ? await generateStoryboard(sourcePath, storyboardPath, storyboardPlan)
       : false

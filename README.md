@@ -135,6 +135,8 @@ Perfis comuns:
 - `VIMEO_MIGRATION_VIDEO_CONCURRENCY`: quantos videos baixar/subir em paralelo.
 - `VIMEO_MIGRATION_HLS_CONCURRENCY`: quantas conversoes HLS em paralelo.
 - `VIDEO_HLS_ENCODER`: `libx264` para CPU ou `h264_nvenc` para NVIDIA.
+- `VIDEO_STORYBOARD_ENABLED`: `1` para gerar storyboard/preview por frames; `0` para pular e manter so poster.
+- `VIDEO_STORYBOARD_MAX_SOURCE_MB`: tamanho maximo do original para gerar storyboard antes do HLS; padrao `2048` MB para nao travar videos grandes no preview.
 - `VIMEO_MIGRATION_FOLDER_URI`: limita a uma pasta do Vimeo.
 - `VIMEO_MIGRATION_LIMIT`: limita a quantidade de videos.
 - `VIMEO_MIGRATION_NOTIFY`: envia notificacoes pela Juliana/Evolution.
