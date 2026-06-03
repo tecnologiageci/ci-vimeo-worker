@@ -45,6 +45,16 @@ def env_bool(name, default):
     return value.strip().lower() in {"1", "true", "yes", "sim", "on"}
 
 
+def env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def write_vtt(path, cues):
     lines = ["WEBVTT", ""]
     for index, cue in enumerate(cues, start=1):
@@ -88,6 +98,7 @@ def prepare_audio_source(source_path, output_dir):
 def transcribe(source_path, model_name, device, compute_type, language, vad_filter):
     from faster_whisper import WhisperModel
 
+    batch_size = max(1, env_int("VIDEO_CAPTIONS_TRANSCRIPTION_BATCH_SIZE", 16))
     attempts = []
     requested_device = (device or "auto").strip().lower()
     if requested_device == "auto":
@@ -109,13 +120,27 @@ def transcribe(source_path, model_name, device, compute_type, language, vad_filt
             emit_progress(f"carregando Whisper {model_name} ({attempt_device})", 1)
             model = WhisperModel(model_name, device=attempt_device, compute_type=attempt_compute)
             emit_progress(f"transcrevendo legenda pt-BR ({attempt_device})", 5)
-            segments, info = model.transcribe(
+            transcriber = model
+            transcribe_kwargs = {}
+            if attempt_device == "cuda" and batch_size > 1:
+                try:
+                    from faster_whisper import BatchedInferencePipeline
+
+                    transcriber = BatchedInferencePipeline(model=model)
+                    transcribe_kwargs["batch_size"] = batch_size
+                    transcribe_kwargs["without_timestamps"] = False
+                    emit_progress(f"transcrevendo legenda pt-BR ({attempt_device}, batch {batch_size})", 5)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[captions] batch indisponivel, usando modo simples: {exc}", file=sys.stderr, flush=True)
+
+            segments, info = transcriber.transcribe(
                 source_path,
                 language=language,
                 task="transcribe",
                 beam_size=5,
                 vad_filter=vad_filter,
                 word_timestamps=False,
+                **transcribe_kwargs,
             )
             duration = float(getattr(info, "duration", 0.0) or 0.0)
             cues = []

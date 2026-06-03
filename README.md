@@ -104,6 +104,7 @@ Variaveis uteis:
 - `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
 - `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
 - `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `float16`, usando FP16 direto na GPU. Se falhar por VRAM, o script tenta fallback automatico para `int8`.
+- `VIDEO_CAPTIONS_TRANSCRIPTION_BATCH_SIZE`: lote da transcricao Whisper na GPU; padrao `16` para usar melhor a RTX em aulas longas.
 - `VIDEO_CAPTIONS_INLINE`: `1` para gerar legenda dentro do job HLS; padrao `0`, gerando job separado de legenda.
 - `VIDEO_CAPTIONS_QUEUE_NAME`: fila dos jobs de legenda criados apos HLS; padrao `legacy`.
 - `VIDEO_CAPTIONS_QUEUE_STATUS`: status dos jobs de legenda criados apos HLS; padrao `queued_legacy`.
