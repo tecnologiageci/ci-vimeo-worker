@@ -88,6 +88,8 @@ Nos uploads novos (`QueueName=uploads`) e nos jobs antigos de legenda (`QueueNam
 - `en`: traducao local com OPUS-MT/Helsinki-NLP.
 - `es`: traducao local via OPUS-MT, mantendo os mesmos timestamps.
 
+Antes de chamar o Whisper, o worker extrai o audio do video para `caption-audio.wav` em mono/16 kHz. Assim a IA le apenas o arquivo de audio, reduzindo I/O e evitando analisar o container MP4/HLS durante a transcricao.
+
 Prepare o ambiente de IA no Windows:
 
 ```powershell
@@ -99,7 +101,7 @@ Variaveis uteis:
 - `VIDEO_CAPTIONS_ENABLED`: `1` para ligar, `0` para desligar.
 - `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
 - `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
-- `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `int8`, mantendo `large-v3` com menor uso de VRAM em videos longos.
+- `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `int8_float16`, usando FP16 na GPU onde couber e quantizacao nas partes que reduzem VRAM.
 - `VIDEO_CAPTIONS_VAD_FILTER`: `1` para filtro VAD do Whisper; padrao `0` para evitar espera longa antes do primeiro progresso em aulas grandes.
 - `VIDEO_CAPTIONS_TRANSLATE`: `1` para gerar ingles/espanhol, `0` para so PT-BR.
 
