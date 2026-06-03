@@ -83,6 +83,22 @@ function rangedPercent(value: number, start: number, end: number) {
   return boundedPercent(((value - start) / (end - start)) * 100)
 }
 
+function finiteNumber(value: unknown) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+function formatClockDuration(value: number) {
+  const total = Math.max(0, Math.floor(value))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
 function normalizeStageText(value: string) {
   return value
     .normalize('NFD')
@@ -90,7 +106,7 @@ function normalizeStageText(value: string) {
     .toLowerCase()
 }
 
-function mapCaptionProgress(stage: string, progress: number) {
+function mapCaptionProgress(stage: string, progress: number, details?: Record<string, unknown>) {
   const normalized = normalizeStageText(stage)
 
   if (normalized.includes('extraindo audio')) {
@@ -100,7 +116,13 @@ function mapCaptionProgress(stage: string, progress: number) {
     return { stage: 'Carregando IA de legenda', progress: 1 }
   }
   if (normalized.includes('transcrevendo')) {
-    return { stage: 'Gerando legenda PT-BR', progress: Math.max(1, rangedPercent(progress, 5, 50)) }
+    const transcribedSeconds = finiteNumber(details?.transcribed_seconds ?? details?.transcribedSeconds)
+    const durationSeconds = finiteNumber(details?.duration_seconds ?? details?.durationSeconds)
+    const captionProgress = Math.max(1, rangedPercent(progress, 5, 50))
+    const suffix = durationSeconds && durationSeconds > 0 && transcribedSeconds != null
+      ? ` · ${formatClockDuration(transcribedSeconds)} de ${formatClockDuration(durationSeconds)} transcritos`
+      : ''
+    return { stage: `Gerando legenda PT-BR${suffix}`, progress: captionProgress }
   }
   if (normalized.includes('carregando traducao')) {
     const language = normalized.includes('es') && !normalized.includes('mul-en') ? 'ES' : 'EN'
@@ -169,7 +191,7 @@ function runCaptionGenerator(args: {
           const event = JSON.parse(line)
           if (event.type === 'progress') {
             const rawProgress = Number(event.progress || 0)
-            const mapped = mapCaptionProgress(String(event.stage || 'gerando legendas'), rawProgress)
+            const mapped = mapCaptionProgress(String(event.stage || 'gerando legendas'), rawProgress, event)
             args.onProgress?.(mapped.stage, mapped.progress)
           }
         } catch {
@@ -597,10 +619,21 @@ export async function processVideoCaptionsOnly(args: {
   const bucket = video.source_bucket || null
   const preparedAudioKey = captionAudioKeyFromPrefix(outputPrefix)
   let tempDir: string | null = null
+  let lastPersistedStage = ''
+  let lastPersistedProgress = -1
+  let lastPersistedAt = 0
 
   const notifyProgress = async (stage: string, progress: number) => {
+    const bounded = boundedPercent(progress)
+    const now = Date.now()
+    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
+      lastPersistedStage = stage
+      lastPersistedProgress = bounded
+      lastPersistedAt = now
+      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
+    }
     try {
-      await args.onProgress?.({ stage, progress })
+      await args.onProgress?.({ stage, progress: bounded })
     } catch {
       /* progresso externo nao deve quebrar processamento */
     }
@@ -728,10 +761,21 @@ export async function processVideoToHls(args: {
   const bucket = video.source_bucket || null
   let tempDir: string | null = null
   let hlsPersisted = Boolean(video.hls_manifest_key)
+  let lastPersistedStage = ''
+  let lastPersistedProgress = -1
+  let lastPersistedAt = 0
 
   const notifyProgress = async (stage: string, progress: number) => {
+    const bounded = boundedPercent(progress)
+    const now = Date.now()
+    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
+      lastPersistedStage = stage
+      lastPersistedProgress = bounded
+      lastPersistedAt = now
+      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
+    }
     try {
-      await args.onProgress?.({ stage, progress })
+      await args.onProgress?.({ stage, progress: bounded })
     } catch {
       /* progresso externo nao deve quebrar processamento */
     }

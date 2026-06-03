@@ -19,8 +19,8 @@ def emit(event_type, **payload):
     print(json.dumps({"type": event_type, **payload}, ensure_ascii=False), flush=True)
 
 
-def emit_progress(stage, progress):
-    emit("progress", stage=stage, progress=max(0, min(100, int(progress))))
+def emit_progress(stage, progress, **payload):
+    emit("progress", stage=stage, progress=max(0, min(100, int(progress))), **payload)
 
 
 def vtt_timestamp(seconds):
@@ -143,6 +143,8 @@ def transcribe(source_path, model_name, device, compute_type, language, vad_filt
                 **transcribe_kwargs,
             )
             duration = float(getattr(info, "duration", 0.0) or 0.0)
+            if duration > 0:
+                emit_progress("transcrevendo legenda pt-BR", 5, transcribed_seconds=0, duration_seconds=duration)
             cues = []
             for segment in segments:
                 start = float(getattr(segment, "start", 0.0) or 0.0)
@@ -152,7 +154,12 @@ def transcribe(source_path, model_name, device, compute_type, language, vad_filt
                     continue
                 cues.append({"start": start, "end": max(end, start + 0.25), "text": text})
                 if duration > 0:
-                    emit_progress("transcrevendo legenda pt-BR", 5 + (end / duration) * 45)
+                    emit_progress(
+                        "transcrevendo legenda pt-BR",
+                        5 + (end / duration) * 45,
+                        transcribed_seconds=end,
+                        duration_seconds=duration,
+                    )
             return cues, {"device": attempt_device, "compute_type": attempt_compute, "duration": duration}
         except Exception as exc:  # noqa: BLE001
             last_error = exc
