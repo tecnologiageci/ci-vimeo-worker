@@ -91,12 +91,12 @@ def transcribe(source_path, model_name, device, compute_type, language, vad_filt
     attempts = []
     requested_device = (device or "auto").strip().lower()
     if requested_device == "auto":
-        attempts.append(("cuda", compute_type or "int8_float16"))
+        attempts.append(("cuda", compute_type or "float16"))
         if (compute_type or "").strip().lower() != "int8":
             attempts.append(("cuda", "int8"))
         attempts.append(("cpu", "int8"))
     elif requested_device == "cuda":
-        attempts.append(("cuda", compute_type or "int8_float16"))
+        attempts.append(("cuda", compute_type or "float16"))
         if (compute_type or "").strip().lower() != "int8":
             attempts.append(("cuda", "int8"))
         attempts.append(("cpu", "int8"))
@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--result-json", required=True)
     parser.add_argument("--model", default=os.environ.get("VIDEO_CAPTIONS_MODEL", "large-v3"))
     parser.add_argument("--device", default=os.environ.get("VIDEO_CAPTIONS_DEVICE", "cuda"))
-    parser.add_argument("--compute-type", default=os.environ.get("VIDEO_CAPTIONS_COMPUTE_TYPE", "int8_float16"))
+    parser.add_argument("--compute-type", default=os.environ.get("VIDEO_CAPTIONS_COMPUTE_TYPE", "float16"))
     parser.add_argument("--language", default=os.environ.get("VIDEO_CAPTIONS_SOURCE_LANGUAGE", "pt"))
     parser.add_argument("--vad-filter", action=argparse.BooleanOptionalAction, default=env_bool("VIDEO_CAPTIONS_VAD_FILTER", False))
     parser.add_argument("--translate", action=argparse.BooleanOptionalAction, default=os.environ.get("VIDEO_CAPTIONS_TRANSLATE", "1") != "0")
