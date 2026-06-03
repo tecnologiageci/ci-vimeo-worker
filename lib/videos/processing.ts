@@ -162,7 +162,7 @@ function runCaptionGenerator(args: {
       '--source', args.sourcePath,
       '--output-dir', args.outputDir,
       '--result-json', args.resultJson,
-      '--model', process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
+      '--model', process.env.VIDEO_CAPTIONS_MODEL || 'large-v3-turbo',
       '--device', process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
       '--compute-type', process.env.VIDEO_CAPTIONS_COMPUTE_TYPE || 'float16',
       '--language', process.env.VIDEO_CAPTIONS_SOURCE_LANGUAGE || 'pt',

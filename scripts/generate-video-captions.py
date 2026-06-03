@@ -236,7 +236,7 @@ def main():
     parser.add_argument("--source", required=False)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--result-json", required=True)
-    parser.add_argument("--model", default=os.environ.get("VIDEO_CAPTIONS_MODEL", "large-v3"))
+    parser.add_argument("--model", default=os.environ.get("VIDEO_CAPTIONS_MODEL", "large-v3-turbo"))
     parser.add_argument("--device", default=os.environ.get("VIDEO_CAPTIONS_DEVICE", "cuda"))
     parser.add_argument("--compute-type", default=os.environ.get("VIDEO_CAPTIONS_COMPUTE_TYPE", "float16"))
     parser.add_argument("--language", default=os.environ.get("VIDEO_CAPTIONS_SOURCE_LANGUAGE", "pt"))

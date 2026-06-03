@@ -101,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File C:\ci-vimeo-agent\scripts\setup-video-c
 Variaveis uteis:
 
 - `VIDEO_CAPTIONS_ENABLED`: `1` para ligar, `0` para desligar.
-- `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
+- `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3-turbo` para acelerar transcricoes longas.
 - `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
 - `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `float16`, usando FP16 direto na GPU. Se falhar por VRAM, o script tenta fallback automatico para `int8`.
 - `VIDEO_CAPTIONS_TRANSCRIPTION_BATCH_SIZE`: lote da transcricao Whisper na GPU; padrao `16` para usar melhor a RTX em aulas longas.
