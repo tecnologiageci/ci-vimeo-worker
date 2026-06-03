@@ -88,7 +88,7 @@ Nos uploads novos (`QueueName=uploads`) e nos jobs antigos de legenda (`QueueNam
 - `en`: traducao local com OPUS-MT/Helsinki-NLP.
 - `es`: traducao local via OPUS-MT, mantendo os mesmos timestamps.
 
-Antes de chamar o Whisper, o worker extrai o audio do video para `caption-audio.wav` em mono/16 kHz. Assim a IA le apenas o arquivo de audio, reduzindo I/O e evitando analisar o container MP4/HLS durante a transcricao.
+Nos uploads novos, o job de HLS tambem extrai e salva no R2 um `caption-audio.wav` em mono/16 kHz, no mesmo prefixo do video (`.../hls/captions/caption-audio.wav`). Assim o job de legenda baixa esse arquivo leve e o Whisper le apenas audio, sem baixar/processar o MP4 inteiro de novo. Se esse audio ainda nao existir, o worker volta ao comportamento antigo e baixa o original como fallback.
 
 Por padrao, o job de HLS nao espera a legenda terminar. Quando o HLS fica pronto, o worker marca o video como pronto e cria um job separado `captions` na fila `legacy`, evitando que um travamento de Whisper segure uploads novos. Para voltar ao comportamento antigo, defina `VIDEO_CAPTIONS_INLINE=1`.
 

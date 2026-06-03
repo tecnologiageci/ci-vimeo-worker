@@ -7,6 +7,7 @@ import { createSupabaseAdmin } from '@/lib/supabase/admin'
 import {
   downloadObjectToFile,
   guessContentType,
+  headR2Object,
   uploadFileToR2,
   writeJsonMetadata,
 } from './r2'
@@ -33,6 +34,12 @@ type StoredCaptionTrack = {
   default: boolean
   source?: string | null
   generated_at: string
+}
+
+const CAPTION_AUDIO_FILE_NAME = 'caption-audio.wav'
+
+function captionAudioKeyFromPrefix(outputPrefix: string) {
+  return `${outputPrefix}/captions/${CAPTION_AUDIO_FILE_NAME}`
 }
 
 function runCommand(command: string, args: string[], cwd?: string): Promise<RunResult> {
@@ -134,7 +141,7 @@ function runCaptionGenerator(args: {
       '--result-json', args.resultJson,
       '--model', process.env.VIDEO_CAPTIONS_MODEL || 'large-v3',
       '--device', process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
-      '--compute-type', process.env.VIDEO_CAPTIONS_COMPUTE_TYPE || 'int8_float16',
+      '--compute-type', process.env.VIDEO_CAPTIONS_COMPUTE_TYPE || 'float16',
       '--language', process.env.VIDEO_CAPTIONS_SOURCE_LANGUAGE || 'pt',
       process.env.VIDEO_CAPTIONS_TRANSLATE === '0' ? '--no-translate' : '--translate',
       '--translation-device', process.env.VIDEO_CAPTIONS_TRANSLATION_DEVICE || 'cpu',
@@ -424,6 +431,44 @@ async function readMediaMetadata(sourcePath: string) {
   }
 }
 
+async function r2ObjectExists(key: string, bucket: string | null) {
+  try {
+    await headR2Object(key, bucket)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function extractCaptionAudio(sourcePath: string, audioPath: string) {
+  await mkdir(path.dirname(audioPath), { recursive: true })
+  await runCommand('ffmpeg', [
+    '-y',
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel', 'error',
+    '-i', sourcePath,
+    '-vn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-c:a', 'pcm_s16le',
+    audioPath,
+  ])
+}
+
+async function generateAndUploadCaptionAudio(args: {
+  sourcePath: string
+  tempDir: string
+  outputPrefix: string
+  bucket: string | null
+}) {
+  const key = captionAudioKeyFromPrefix(args.outputPrefix)
+  const audioPath = path.join(args.tempDir, CAPTION_AUDIO_FILE_NAME)
+  await extractCaptionAudio(args.sourcePath, audioPath)
+  await uploadFileToR2(audioPath, key, 'audio/wav', args.bucket)
+  return key
+}
+
 async function generatePoster(sourcePath: string, posterPath: string) {
   try {
     await runCommand('ffmpeg', [
@@ -512,11 +557,11 @@ export async function processVideoCaptionsOnly(args: {
 
   if (error || !asset) throw new Error(error?.message || 'Vídeo não encontrado.')
   const video = asset as VideoAsset
-  if (!video.source_key) throw new Error('Vídeo sem arquivo original no R2.')
   if (!video.hls_manifest_key) throw new Error('Vídeo ainda não tem HLS pronto.')
 
   const outputPrefix = video.hls_prefix || dirnameFromR2Key(video.hls_manifest_key) || `videos/${video.id}/hls`
   const bucket = video.source_bucket || null
+  const preparedAudioKey = captionAudioKeyFromPrefix(outputPrefix)
   let tempDir: string | null = null
 
   const notifyProgress = async (stage: string, progress: number) => {
@@ -540,11 +585,21 @@ export async function processVideoCaptionsOnly(args: {
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-captions-'))
-    const sourcePath = path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
+    const hasPreparedAudio = await r2ObjectExists(preparedAudioKey, bucket)
+    const sourcePath = hasPreparedAudio
+      ? path.join(tempDir, CAPTION_AUDIO_FILE_NAME)
+      : path.join(tempDir, `source${localSourceExtension(video.source_key || '')}`)
 
-    await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
-    await notifyProgress('Baixando original do R2', 0)
-    await downloadObjectToFile(video.source_key, sourcePath, bucket)
+    if (hasPreparedAudio) {
+      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando áudio leve do R2' })
+      await notifyProgress('Baixando áudio leve do R2', 0)
+      await downloadObjectToFile(preparedAudioKey, sourcePath, bucket)
+    } else {
+      if (!video.source_key) throw new Error('Vídeo sem arquivo original ou áudio leve no R2.')
+      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
+      await notifyProgress('Baixando original do R2', 0)
+      await downloadObjectToFile(video.source_key, sourcePath, bucket)
+    }
 
     await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
     await notifyProgress('Extraindo áudio da legenda', 0)
@@ -758,6 +813,23 @@ export async function processVideoToHls(args: {
     let captionTracks: StoredCaptionTrack[] = []
     const captionsEnabled = envFlag('VIDEO_CAPTIONS_ENABLED', false)
     const captionsInline = envFlag('VIDEO_CAPTIONS_INLINE', false)
+    let captionAudioKey: string | null = null
+    let captionAudioError: string | null = null
+    if (captionsEnabled) {
+      try {
+        await updateJob(args.jobId, { progress: 100, current_stage: 'Extraindo áudio leve para legenda' })
+        await notifyProgress('Extraindo áudio leve para legenda', 100)
+        captionAudioKey = await generateAndUploadCaptionAudio({
+          sourcePath,
+          tempDir,
+          outputPrefix,
+          bucket,
+        })
+      } catch (error) {
+        captionAudioError = error instanceof Error ? error.message : String(error)
+        console.warn('[videos] extração do áudio leve da legenda falhou:', captionAudioError)
+      }
+    }
     let captionsQueued = false
     if (captionsEnabled && captionsInline) {
       await updateJob(args.jobId, { progress: 0, current_stage: 'HLS pronto; extraindo áudio da legenda' })
@@ -804,6 +876,8 @@ export async function processVideoToHls(args: {
       posterKey: finalPosterKey,
       storyboardKey: finalStoryboardKey,
       storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
+      captionAudioKey,
+      captionAudioError,
       captionTracks,
       processedAt: new Date().toISOString(),
       ...metadata,

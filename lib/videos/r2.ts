@@ -113,6 +113,7 @@ export function guessContentType(key: string) {
   if (lower.endsWith('.mp4')) return 'video/mp4'
   if (lower.endsWith('.webm')) return 'video/webm'
   if (lower.endsWith('.mov')) return 'video/quicktime'
+  if (lower.endsWith('.wav')) return 'audio/wav'
   if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
   if (lower.endsWith('.png')) return 'image/png'
   if (lower.endsWith('.webp')) return 'image/webp'
