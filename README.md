@@ -90,6 +90,8 @@ Nos uploads novos (`QueueName=uploads`) e nos jobs antigos de legenda (`QueueNam
 
 Antes de chamar o Whisper, o worker extrai o audio do video para `caption-audio.wav` em mono/16 kHz. Assim a IA le apenas o arquivo de audio, reduzindo I/O e evitando analisar o container MP4/HLS durante a transcricao.
 
+Por padrao, o job de HLS nao espera a legenda terminar. Quando o HLS fica pronto, o worker marca o video como pronto e cria um job separado `captions` na fila `legacy`, evitando que um travamento de Whisper segure uploads novos. Para voltar ao comportamento antigo, defina `VIDEO_CAPTIONS_INLINE=1`.
+
 Prepare o ambiente de IA no Windows:
 
 ```powershell
@@ -102,6 +104,9 @@ Variaveis uteis:
 - `VIDEO_CAPTIONS_MODEL`: modelo Whisper, padrao `large-v3`.
 - `VIDEO_CAPTIONS_DEVICE`: `cuda`, `cpu` ou `auto`; padrao `cuda` com fallback para CPU.
 - `VIDEO_CAPTIONS_COMPUTE_TYPE`: padrao `float16`, usando FP16 direto na GPU. Se falhar por VRAM, o script tenta fallback automatico para `int8`.
+- `VIDEO_CAPTIONS_INLINE`: `1` para gerar legenda dentro do job HLS; padrao `0`, gerando job separado de legenda.
+- `VIDEO_CAPTIONS_QUEUE_NAME`: fila dos jobs de legenda criados apos HLS; padrao `legacy`.
+- `VIDEO_CAPTIONS_QUEUE_STATUS`: status dos jobs de legenda criados apos HLS; padrao `queued_legacy`.
 - `VIDEO_CAPTIONS_VAD_FILTER`: `1` para filtro VAD do Whisper; padrao `0` para evitar espera longa antes do primeiro progresso em aulas grandes.
 - `VIDEO_CAPTIONS_TRANSLATE`: `1` para gerar ingles/espanhol, `0` para so PT-BR.
 

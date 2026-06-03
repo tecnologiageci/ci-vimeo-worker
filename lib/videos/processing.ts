@@ -61,6 +61,11 @@ function envFlag(name: string, fallback = false) {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
 }
 
+function envText(name: string, fallback: string) {
+  const value = process.env[name]
+  return value == null || value.trim() === '' ? fallback : value.trim()
+}
+
 function boundedPercent(value: number) {
   return Math.max(0, Math.min(100, Math.round(Number.isFinite(value) ? value : 0)))
 }
@@ -225,6 +230,53 @@ async function generateAndUploadCaptionTracks(args: {
 
   const primaryCaptionsKey = captionTracks.find((track) => track.language === 'pt-BR')?.key || captionTracks[0]?.key || null
   return { captionTracks, primaryCaptionsKey }
+}
+
+async function enqueueCaptionJob(args: {
+  assetId: string
+  sourceKey: string | null
+  outputPrefix: string
+  createdBy: string | null
+}) {
+  const db = createSupabaseAdmin()
+  if (!db) throw new Error('Supabase não configurado.')
+
+  const captionQueueName = envText('VIDEO_CAPTIONS_QUEUE_NAME', 'legacy')
+  const captionQueueStatus = envText(
+    'VIDEO_CAPTIONS_QUEUE_STATUS',
+    captionQueueName === 'legacy' ? 'queued_legacy' : 'queued',
+  )
+
+  const { data: existing, error: existingError } = await db
+    .from('video_processing_jobs')
+    .select('id')
+    .eq('video_asset_id', args.assetId)
+    .eq('job_type', 'captions')
+    .in('status', ['queued', 'queued_legacy', 'processing'])
+    .limit(1)
+    .maybeSingle()
+
+  if (existingError) throw existingError
+  if (existing?.id) return existing
+
+  const { data, error } = await db
+    .from('video_processing_jobs')
+    .insert({
+      video_asset_id: args.assetId,
+      job_type: 'captions',
+      status: captionQueueStatus,
+      queue_name: captionQueueName,
+      progress: 0,
+      source_key: args.sourceKey,
+      output_prefix: args.outputPrefix,
+      current_stage: 'Aguardando legenda',
+      created_by: args.createdBy,
+    })
+    .select('id')
+    .single()
+
+  if (error) throw error
+  return data
 }
 
 function secondsFromFfmpegProgress(line: string) {
@@ -705,7 +757,9 @@ export async function processVideoToHls(args: {
     let primaryCaptionsKey: string | null = null
     let captionTracks: StoredCaptionTrack[] = []
     const captionsEnabled = envFlag('VIDEO_CAPTIONS_ENABLED', false)
-    if (captionsEnabled) {
+    const captionsInline = envFlag('VIDEO_CAPTIONS_INLINE', false)
+    let captionsQueued = false
+    if (captionsEnabled && captionsInline) {
       await updateJob(args.jobId, { progress: 0, current_stage: 'HLS pronto; extraindo áudio da legenda' })
       await notifyProgress('Extraindo áudio da legenda', 0)
 
@@ -722,9 +776,25 @@ export async function processVideoToHls(args: {
       captionTracks = captionsResult.captionTracks
       primaryCaptionsKey = captionsResult.primaryCaptionsKey
       await notifyProgress('Legendas enviadas para R2', 100)
+    } else if (captionsEnabled) {
+      await enqueueCaptionJob({
+        assetId: video.id,
+        sourceKey: video.source_key,
+        outputPrefix,
+        createdBy: args.userId,
+      })
+      captionsQueued = true
+      await notifyProgress('Vídeo pronto; legenda entrou na fila', 100)
     }
 
-    await notifyProgress(captionsEnabled ? 'Legendas concluídas' : 'Vídeo pronto; legendas ficam para depois', 100)
+    await notifyProgress(
+      captionsInline && captionTracks.length > 0
+        ? 'Legendas concluídas'
+        : captionsQueued
+          ? 'Vídeo pronto; legenda entrou na fila'
+          : 'Vídeo pronto; legendas ficam para depois',
+      100,
+    )
 
     await writeJsonMetadata(metadataKey, {
       assetId: video.id,
@@ -743,6 +813,7 @@ export async function processVideoToHls(args: {
       status: 'completed',
       progress: 100,
       completed_at: new Date().toISOString(),
+      current_stage: captionsQueued ? 'HLS concluído; legenda na fila' : 'Concluído',
     })
     await notifyProgress('Concluído', 100)
 
