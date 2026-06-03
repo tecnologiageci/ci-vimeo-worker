@@ -97,10 +97,10 @@ function mapCaptionProgress(stage: string, progress: number) {
     return { stage: 'Extraindo áudio da legenda', progress: boundedPercent(progress) }
   }
   if (normalized.includes('carregando whisper')) {
-    return { stage: 'Carregando IA de legenda', progress: 0 }
+    return { stage: 'Carregando IA de legenda', progress: 1 }
   }
   if (normalized.includes('transcrevendo')) {
-    return { stage: 'Gerando legenda PT-BR', progress: rangedPercent(progress, 5, 50) }
+    return { stage: 'Gerando legenda PT-BR', progress: Math.max(1, rangedPercent(progress, 5, 50)) }
   }
   if (normalized.includes('carregando traducao')) {
     const language = normalized.includes('es') && !normalized.includes('mul-en') ? 'ES' : 'EN'
