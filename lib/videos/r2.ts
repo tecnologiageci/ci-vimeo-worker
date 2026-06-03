@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { stat, writeFile } from 'node:fs/promises'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import {
   AbortMultipartUploadCommand,
@@ -161,6 +161,43 @@ export async function downloadObjectToFile(key: string, destination: string, buc
   const { client, config } = await getR2ClientAndConfigForBucket(bucket)
   const result = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: key }))
   await pipeline(bodyToReadable(result.Body), createWriteStream(destination))
+}
+
+export type R2DownloadProgress = {
+  downloadedBytes: number
+  totalBytes: number | null
+  percent: number | null
+}
+
+export async function downloadObjectToFileWithProgress(
+  key: string,
+  destination: string,
+  bucket?: string | null,
+  onProgress?: (progress: R2DownloadProgress) => void | Promise<void>,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
+  const result = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: key }))
+  const totalBytes = Number(result.ContentLength || 0) > 0 ? Number(result.ContentLength) : null
+  let downloadedBytes = 0
+  let lastPercent = -1
+
+  const progressStream = new Transform({
+    transform(chunk, _encoding, callback) {
+      downloadedBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)
+      const percent = totalBytes
+        ? Math.max(0, Math.min(100, Math.round((downloadedBytes / totalBytes) * 100)))
+        : null
+
+      if (percent == null || percent !== lastPercent) {
+        if (percent != null) lastPercent = percent
+        Promise.resolve(onProgress?.({ downloadedBytes, totalBytes, percent })).catch(() => undefined)
+      }
+      callback(null, chunk)
+    },
+  })
+
+  await pipeline(bodyToReadable(result.Body), progressStream, createWriteStream(destination))
+  await Promise.resolve(onProgress?.({ downloadedBytes, totalBytes, percent: 100 })).catch(() => undefined)
 }
 
 export async function uploadFileToR2(

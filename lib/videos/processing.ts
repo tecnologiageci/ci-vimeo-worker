@@ -5,11 +5,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
 import {
-  downloadObjectToFile,
+  downloadObjectToFileWithProgress,
   guessContentType,
   headR2Object,
   uploadFileToR2,
   writeJsonMetadata,
+  type R2DownloadProgress,
 } from './r2'
 import { buildStoryboardPlan, type StoryboardPlan } from './storyboard'
 import type { VideoAsset } from './types'
@@ -398,6 +399,27 @@ async function updateAsset(assetId: string, patch: Record<string, unknown>, opti
   if (error && !options?.ignoreError) throw error
 }
 
+function createDownloadProgressReporter(
+  jobId: string,
+  stage: string,
+  notifyProgress: (stage: string, progress: number) => Promise<void>,
+) {
+  let lastProgress = -1
+  let lastPersistedAt = 0
+
+  return (event: R2DownloadProgress) => {
+    const progress = boundedPercent(event.percent ?? 0)
+    const now = Date.now()
+    if (progress <= lastProgress && now - lastPersistedAt < 5000) return
+    if (progress < 100 && progress - lastProgress < 2 && now - lastPersistedAt < 2500) return
+
+    lastProgress = progress
+    lastPersistedAt = now
+    updateJob(jobId, { progress, current_stage: stage }).catch(() => undefined)
+    notifyProgress(stage, progress).catch(() => undefined)
+  }
+}
+
 async function listFilesRecursive(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true })
   const files = await Promise.all(entries.map(async (entry) => {
@@ -593,12 +615,22 @@ export async function processVideoCaptionsOnly(args: {
     if (hasPreparedAudio) {
       await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando áudio leve do R2' })
       await notifyProgress('Baixando áudio leve do R2', 0)
-      await downloadObjectToFile(preparedAudioKey, sourcePath, bucket)
+      await downloadObjectToFileWithProgress(
+        preparedAudioKey,
+        sourcePath,
+        bucket,
+        createDownloadProgressReporter(args.jobId, 'Baixando áudio leve do R2', notifyProgress),
+      )
     } else {
       if (!video.source_key) throw new Error('Vídeo sem arquivo original ou áudio leve no R2.')
       await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
       await notifyProgress('Baixando original do R2', 0)
-      await downloadObjectToFile(video.source_key, sourcePath, bucket)
+      await downloadObjectToFileWithProgress(
+        video.source_key,
+        sourcePath,
+        bucket,
+        createDownloadProgressReporter(args.jobId, 'Baixando original do R2', notifyProgress),
+      )
     }
 
     await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
@@ -718,7 +750,12 @@ export async function processVideoToHls(args: {
     } else {
       await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
       await notifyProgress('Baixando original do R2', 0)
-      await downloadObjectToFile(video.source_key, sourcePath, bucket)
+      await downloadObjectToFileWithProgress(
+        video.source_key,
+        sourcePath,
+        bucket,
+        createDownloadProgressReporter(args.jobId, 'Baixando original do R2', notifyProgress),
+      )
     }
 
     await updateJob(args.jobId, { progress: 0, current_stage: 'Gerando preview rápido' })
