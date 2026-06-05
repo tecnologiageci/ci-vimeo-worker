@@ -12,6 +12,14 @@ type ProcessingJob = {
   source_key: string | null
   status: string
   job_type?: string | null
+  created_at?: string | null
+  video_assets?: {
+    created_at?: string | null
+    upload_finished_at?: string | null
+  } | Array<{
+    created_at?: string | null
+    upload_finished_at?: string | null
+  }> | null
 }
 
 function envNumber(name: string, fallback: number) {
@@ -47,6 +55,21 @@ const jobStallMinutes = envNumber('VIDEO_PROCESSING_JOB_STALL_MINUTES', 90)
 const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', true)
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
 const pauseLegacyForUploads = envFlag('VIDEO_PROCESSING_PAUSE_LEGACY_FOR_UPLOADS', queueName === 'legacy')
+
+function firstRelatedAsset(job: ProcessingJob) {
+  const asset = job.video_assets
+  return Array.isArray(asset) ? asset[0] : asset
+}
+
+function timeValue(value?: string | null) {
+  const parsed = value ? new Date(value).getTime() : 0
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function r2EnteredAt(job: ProcessingJob) {
+  const asset = firstRelatedAsset(job)
+  return timeValue(asset?.upload_finished_at || asset?.created_at || job.created_at)
+}
 
 function hasCaptionTracks(asset: any) {
   return Boolean(asset?.captions_key)
@@ -116,15 +139,21 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
 
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
-    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name')
+    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name, video_assets(created_at, upload_finished_at)')
     .eq('status', queueStatus)
     .eq('queue_name', queueName)
     .order('created_at', { ascending: false })
-    .limit(5)
+    .limit(queueName === 'legacy' ? 10000 : 250)
 
   if (error) throw error
 
-  for (const candidate of candidates || []) {
+  const sortedCandidates = [...(candidates || [])].sort((a: ProcessingJob, b: ProcessingJob) => {
+    const r2Diff = r2EnteredAt(b) - r2EnteredAt(a)
+    if (r2Diff !== 0) return r2Diff
+    return timeValue(b.created_at) - timeValue(a.created_at)
+  })
+
+  for (const candidate of sortedCandidates) {
     const { data: claimed, error: claimError } = await db
       .from('video_processing_jobs')
       .update({
