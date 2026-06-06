@@ -442,6 +442,30 @@ function createDownloadProgressReporter(
   }
 }
 
+function createRangedDownloadProgressReporter(
+  jobId: string,
+  stage: string,
+  notifyProgress: (stage: string, progress: number) => Promise<void>,
+  start: number,
+  end: number,
+) {
+  let lastProgress = -1
+  let lastPersistedAt = 0
+
+  return (event: R2DownloadProgress) => {
+    const rawProgress = boundedPercent(event.percent ?? 0)
+    const progress = boundedPercent(start + (rawProgress / 100) * (end - start))
+    const now = Date.now()
+    if (progress <= lastProgress && now - lastPersistedAt < 5000) return
+    if (progress < end && progress - lastProgress < 2 && now - lastPersistedAt < 2500) return
+
+    lastProgress = progress
+    lastPersistedAt = now
+    updateJob(jobId, { progress, current_stage: stage }).catch(() => undefined)
+    notifyProgress(stage, progress).catch(() => undefined)
+  }
+}
+
 async function listFilesRecursive(dir: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true })
   const files = await Promise.all(entries.map(async (entry) => {
@@ -553,6 +577,11 @@ async function generateStoryboard(sourcePath: string, storyboardPath: string, pl
     console.warn('[videos] geração de storyboard falhou:', error instanceof Error ? error.message : error)
     return false
   }
+}
+
+async function generateStoryboardStrict(sourcePath: string, storyboardPath: string, plan: StoryboardPlan) {
+  const created = await generateStoryboard(sourcePath, storyboardPath, plan)
+  if (!created) throw new Error('ffmpeg terminou sem criar storyboard.')
 }
 
 async function mapWithConcurrency<T>(
@@ -720,6 +749,134 @@ export async function processVideoCaptionsOnly(args: {
       error_message: message,
       completed_at: new Date().toISOString(),
       current_stage: 'erro nas legendas',
+    })
+    await updateAsset(video.id, {
+      last_error: message,
+      updated_by: args.userId,
+    }, { ignoreError: true })
+    throw error
+  } finally {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+}
+
+export async function processVideoStoryboardOnly(args: {
+  assetId: string
+  jobId: string
+  userId: string | null
+  onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
+}) {
+  const db = createSupabaseAdmin()
+  if (!db) throw new Error('Supabase não configurado.')
+
+  const { data: asset, error } = await db
+    .from('video_assets')
+    .select('*')
+    .eq('id', args.assetId)
+    .single()
+
+  if (error || !asset) throw new Error(error?.message || 'Vídeo não encontrado.')
+  const video = asset as VideoAsset
+  if (!video.source_key) throw new Error('Vídeo sem arquivo original no R2.')
+  if (!video.hls_manifest_key) throw new Error('Vídeo ainda não tem HLS pronto.')
+
+  const outputPrefix = video.hls_prefix || dirnameFromR2Key(video.hls_manifest_key) || `videos/${video.id}/hls`
+  const storyboardKey = `${outputPrefix}/storyboard.webp`
+  const bucket = video.source_bucket || null
+  let tempDir: string | null = null
+  let lastPersistedStage = ''
+  let lastPersistedProgress = -1
+  let lastPersistedAt = 0
+
+  const notifyProgress = async (stage: string, progress: number) => {
+    const bounded = boundedPercent(progress)
+    const now = Date.now()
+    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
+      lastPersistedStage = stage
+      lastPersistedProgress = bounded
+      lastPersistedAt = now
+      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
+    }
+    try {
+      await args.onProgress?.({ stage, progress: bounded })
+    } catch {
+      /* progresso externo nao deve quebrar processamento */
+    }
+  }
+
+  await updateJob(args.jobId, {
+    status: 'processing',
+    progress: 0,
+    source_key: video.source_key,
+    output_prefix: outputPrefix,
+    started_at: new Date().toISOString(),
+    current_stage: 'Preparando preview rapido',
+    error_message: null,
+  })
+  await notifyProgress('Preparando preview rapido', 0)
+
+  try {
+    tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-storyboard-'))
+    const sourcePath = path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
+    const storyboardPath = path.join(tempDir, 'storyboard.webp')
+
+    await notifyProgress('Baixando original para preview rapido', 0)
+    await downloadObjectToFileWithProgress(
+      video.source_key,
+      sourcePath,
+      bucket,
+      createRangedDownloadProgressReporter(args.jobId, 'Baixando original para preview rapido', notifyProgress, 0, 25),
+    )
+
+    await notifyProgress('Lendo metadados do preview rapido', 30)
+    const metadata = await readMediaMetadata(sourcePath)
+    const storyboardPlan = buildStoryboardPlan({
+      durationSeconds: metadata.duration_seconds || video.duration_seconds,
+      width: metadata.width || video.width,
+      height: metadata.height || video.height,
+      maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
+      frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
+      columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
+    })
+    if (!storyboardPlan) throw new Error('Metadata insuficiente para gerar preview rapido.')
+
+    await notifyProgress('Gerando preview rapido', 35)
+    await generateStoryboardStrict(sourcePath, storyboardPath, storyboardPlan)
+
+    await notifyProgress('Enviando preview rapido para R2', 90)
+    await uploadFileToR2(storyboardPath, storyboardKey, 'image/webp', bucket)
+
+    await updateAsset(video.id, {
+      storyboard_key: storyboardKey,
+      storyboard_interval_seconds: storyboardPlan.intervalSeconds,
+      storyboard_columns: storyboardPlan.columns,
+      storyboard_rows: storyboardPlan.rows,
+      storyboard_frame_width: storyboardPlan.frameWidth,
+      storyboard_frame_height: storyboardPlan.frameHeight,
+      storyboard_frame_count: storyboardPlan.frameCount,
+      last_error: null,
+      updated_by: args.userId,
+    }, { ignoreError: true })
+
+    await updateJob(args.jobId, {
+      status: 'completed',
+      progress: 100,
+      completed_at: new Date().toISOString(),
+      current_stage: 'Preview rapido concluido',
+    })
+    await notifyProgress('Preview rapido concluido', 100)
+
+    return { storyboardKey, storyboard: storyboardPlan, metadata }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await updateJob(args.jobId, {
+      status: 'failed',
+      progress: 100,
+      error_message: message,
+      completed_at: new Date().toISOString(),
+      current_stage: 'erro no preview rapido',
     })
     await updateAsset(video.id, {
       last_error: message,

@@ -1,7 +1,7 @@
 import { config as loadEnv } from 'dotenv'
 import { setTimeout as wait } from 'node:timers/promises'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
-import { processVideoCaptionsOnly, processVideoToHls } from '@/lib/videos/processing'
+import { processVideoCaptionsOnly, processVideoStoryboardOnly, processVideoToHls } from '@/lib/videos/processing'
 
 loadEnv({ path: '.env.local' })
 loadEnv({ path: '.env' })
@@ -15,9 +15,11 @@ type ProcessingJob = {
   created_at?: string | null
   video_assets?: {
     created_at?: string | null
+    processed_at?: string | null
     upload_finished_at?: string | null
   } | Array<{
     created_at?: string | null
+    processed_at?: string | null
     upload_finished_at?: string | null
   }> | null
 }
@@ -45,7 +47,7 @@ const queueStatus = envText('VIDEO_PROCESSING_QUEUE_STATUS', 'queued')
 const queueName = envText('VIDEO_PROCESSING_QUEUE_NAME', queueStatus === 'queued_legacy' ? 'legacy' : 'uploads')
 const queueLabel = envText(
   'VIDEO_PROCESSING_QUEUE_LABEL',
-  queueName === 'legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
+  queueName === 'preview' ? 'preview rapido' : queueName === 'legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
 )
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
 const heartbeatMs = envNumber('VIDEO_PROCESSING_HEARTBEAT_MS', 15_000)
@@ -68,7 +70,7 @@ function timeValue(value?: string | null) {
 
 function r2EnteredAt(job: ProcessingJob) {
   const asset = firstRelatedAsset(job)
-  return timeValue(asset?.upload_finished_at || asset?.created_at || job.created_at)
+  return timeValue(asset?.upload_finished_at || asset?.processed_at || asset?.created_at || job.created_at)
 }
 
 function hasCaptionTracks(asset: any) {
@@ -100,6 +102,7 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
     capabilities: {
       hlsProcessor: true,
       externalVideoProcessing: true,
+      storyboard: queueName === 'preview',
       captions: envFlag('VIDEO_CAPTIONS_ENABLED', false),
       gpu: true,
     },
@@ -139,11 +142,11 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
 
   const { data: candidates, error } = await db
     .from('video_processing_jobs')
-    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name, video_assets(created_at, upload_finished_at)')
+    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name, video_assets(created_at, processed_at, upload_finished_at)')
     .eq('status', queueStatus)
     .eq('queue_name', queueName)
     .order('created_at', { ascending: false })
-    .limit(queueName === 'legacy' ? 10000 : 250)
+    .limit(queueName === 'uploads' ? 250 : 10000)
 
   if (error) throw error
 
@@ -185,9 +188,16 @@ async function processJob(db: any, job: ProcessingJob) {
 
   const title = asset?.title || job.video_asset_id
   console.log(`[${workerName}] processando ${title} (${job.id})`)
-  const captionsOnly = job.job_type === 'captions'
+  const storyboardOnly = job.job_type === 'storyboard' || queueName === 'preview'
+  const captionsOnly = !storyboardOnly && (
+    job.job_type === 'captions'
     || (asset?.hls_manifest_key && !hasCaptionTracks(asset))
-  let currentStage = captionsOnly ? 'gerando legendas pt-BR, ingles e espanhol' : 'convertendo para HLS'
+  )
+  let currentStage = storyboardOnly
+    ? 'gerando preview rapido'
+    : captionsOnly
+      ? 'gerando legendas pt-BR, ingles e espanhol'
+      : 'convertendo para HLS'
   let currentProgress = 1
   let lastProgressAt = Date.now()
   let exitingForStall = false
@@ -256,7 +266,11 @@ async function processJob(db: any, job: ProcessingJob) {
   })
 
   try {
-    const processor = captionsOnly ? processVideoCaptionsOnly : processVideoToHls
+    const processor = storyboardOnly
+      ? processVideoStoryboardOnly
+      : captionsOnly
+        ? processVideoCaptionsOnly
+        : processVideoToHls
     await processor({
       assetId: job.video_asset_id,
       jobId: job.id,
