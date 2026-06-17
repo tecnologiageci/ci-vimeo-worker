@@ -1,7 +1,12 @@
 import { config as loadEnv } from 'dotenv'
 import { setTimeout as wait } from 'node:timers/promises'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
-import { processVideoCaptionsOnly, processVideoStoryboardOnly, processVideoToHls } from '@/lib/videos/processing'
+import {
+  processVideoHls720Variant,
+  processVideoStoryboardOnly,
+  processVideoToHls,
+  VideoProcessingCancelledError,
+} from '@/lib/videos/processing'
 
 loadEnv({ path: '.env.local' })
 loadEnv({ path: '.env' })
@@ -12,6 +17,7 @@ type ProcessingJob = {
   source_key: string | null
   status: string
   job_type?: string | null
+  queue_name?: string | null
   created_at?: string | null
   video_assets?: {
     created_at?: string | null
@@ -47,7 +53,13 @@ const queueStatus = envText('VIDEO_PROCESSING_QUEUE_STATUS', 'queued')
 const queueName = envText('VIDEO_PROCESSING_QUEUE_NAME', queueStatus === 'queued_legacy' ? 'legacy' : 'uploads')
 const queueLabel = envText(
   'VIDEO_PROCESSING_QUEUE_LABEL',
-  queueName === 'preview' ? 'preview rapido' : queueName === 'legacy' ? 'fila antiga HLS' : 'uploads novos HLS',
+  queueName === 'preview'
+    ? 'preview rapido'
+    : queueName === 'hls_720'
+      ? 'variantes 720p'
+      : queueName === 'legacy'
+        ? 'fila antiga HLS'
+        : 'uploads novos HLS',
 )
 const pollMs = envNumber('VIDEO_PROCESSING_WORKER_POLL_MS', 15_000)
 const heartbeatMs = envNumber('VIDEO_PROCESSING_HEARTBEAT_MS', 15_000)
@@ -55,8 +67,26 @@ const concurrency = Math.max(1, Math.min(4, envNumber('VIDEO_PROCESSING_WORKER_C
 const staleMinutes = envNumber('VIDEO_PROCESSING_STALE_MINUTES', 45)
 const jobStallMinutes = envNumber('VIDEO_PROCESSING_JOB_STALL_MINUTES', 90)
 const requeueStale = envFlag('VIDEO_PROCESSING_REQUEUE_STALE', true)
+const prioritizeUploads = envFlag('VIDEO_PROCESSING_PRIORITIZE_UPLOADS', queueName === 'preview' || queueName === 'hls_720')
 const once = envFlag('VIDEO_PROCESSING_WORKER_ONCE', false)
-const pauseLegacyForUploads = envFlag('VIDEO_PROCESSING_PAUSE_LEGACY_FOR_UPLOADS', queueName === 'legacy')
+const PAUSED_STATUSES = new Set(['paused', 'stopping'])
+
+class WorkerPauseRequestedError extends Error {
+  constructor(message = 'Worker pausado pela interface.') {
+    super(message)
+    this.name = 'WorkerPauseRequestedError'
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function isPauseRequestedError(error: unknown) {
+  return error instanceof WorkerPauseRequestedError
+    || error instanceof VideoProcessingCancelledError
+    || (error instanceof Error && ['WorkerPauseRequestedError', 'VideoProcessingCancelledError'].includes(error.name))
+}
 
 function firstRelatedAsset(job: ProcessingJob) {
   const asset = job.video_assets
@@ -73,23 +103,31 @@ function r2EnteredAt(job: ProcessingJob) {
   return timeValue(asset?.upload_finished_at || asset?.processed_at || asset?.created_at || job.created_at)
 }
 
-function hasCaptionTracks(asset: any) {
-  return Boolean(asset?.captions_key)
-    || (Array.isArray(asset?.caption_tracks) && asset.caption_tracks.length > 0)
+function workerQueuePreferences() {
+  const queues = prioritizeUploads && queueName !== 'uploads' && queueName !== 'legacy'
+    ? ['uploads', queueName]
+    : [queueName]
+  return Array.from(new Set(queues.filter(Boolean)))
 }
 
-async function countActiveUploadJobs(db: any) {
-  const { count, error } = await db
-    .from('video_processing_jobs')
-    .select('id', { count: 'exact', head: true })
-    .eq('queue_name', 'uploads')
-    .in('status', ['queued', 'processing'])
+function queuedStatusForQueue(name?: string | null) {
+  return name === 'legacy' ? 'queued_legacy' : 'queued'
+}
 
-  if (error) throw error
-  return count || 0
+function queuedStatusForJob(job: ProcessingJob) {
+  return queuedStatusForQueue(job.queue_name || queueName)
 }
 
 async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
+  const { data: storedWorker, error: storedWorkerError } = await db
+    .from('video_migration_workers')
+    .select('config')
+    .eq('worker_name', workerName)
+    .maybeSingle()
+
+  if (storedWorkerError) throw storedWorkerError
+  const storedConfig = isRecord(storedWorker?.config) ? storedWorker.config : {}
+
   await db.from('video_migration_workers').upsert({
     worker_name: workerName,
     display_name: displayName,
@@ -103,77 +141,164 @@ async function updateHeartbeat(db: any, patch: Record<string, unknown> = {}) {
       hlsProcessor: true,
       externalVideoProcessing: true,
       storyboard: queueName === 'preview',
-      captions: envFlag('VIDEO_CAPTIONS_ENABLED', false),
+      hls720: queueName === 'hls_720',
       gpu: true,
     },
     config: {
+      ...storedConfig,
       role: 'secondary-video-processing-server',
       queueName,
+      queueNames: workerQueuePreferences(),
       queueStatus,
       queueLabel,
       concurrency,
       encoder: process.env.VIDEO_HLS_ENCODER || null,
-      captionsEnabled: envFlag('VIDEO_CAPTIONS_ENABLED', false),
-      captionsModel: process.env.VIDEO_CAPTIONS_MODEL || 'large-v3-turbo',
-      captionsDevice: process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
-      captionsTranslate: process.env.VIDEO_CAPTIONS_TRANSLATE !== '0',
-      pauseLegacyForUploads,
+      prioritizeUploads,
     },
     last_error: patch.last_error || patch.lastError || null,
     heartbeat_at: new Date().toISOString(),
   }, { onConflict: 'worker_name' })
 }
 
-async function claimNextJob(db: any): Promise<ProcessingJob | null> {
-  if (requeueStale) {
-    const staleBefore = new Date(Date.now() - staleMinutes * 60_000).toISOString()
-    await db
-      .from('video_processing_jobs')
-      .update({
-        status: queueStatus,
-        progress: 0,
-        current_stage: `reenfileirado por ausencia de progresso por ${staleMinutes} minutos`,
-        error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
-      })
-      .eq('status', 'processing')
-      .eq('queue_name', queueName)
-      .lt('updated_at', staleBefore)
-  }
-
-  const { data: candidates, error } = await db
-    .from('video_processing_jobs')
-    .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name, video_assets(created_at, processed_at, upload_finished_at)')
-    .eq('status', queueStatus)
-    .eq('queue_name', queueName)
-    .order('created_at', { ascending: false })
-    .limit(queueName === 'uploads' ? 250 : 10000)
+async function isWorkerPaused(db: any) {
+  const { data, error } = await db
+    .from('video_migration_workers')
+    .select('status,config')
+    .eq('worker_name', workerName)
+    .maybeSingle()
 
   if (error) throw error
+  const config = isRecord(data?.config) ? data.config : {}
+  return PAUSED_STATUSES.has(String(data?.status || '').toLowerCase())
+    || config.manualPaused === true
+    || config.manual_paused === true
+}
 
-  const sortedCandidates = [...(candidates || [])].sort((a: ProcessingJob, b: ProcessingJob) => {
-    const r2Diff = r2EnteredAt(b) - r2EnteredAt(a)
-    if (r2Diff !== 0) return r2Diff
-    return timeValue(b.created_at) - timeValue(a.created_at)
+async function waitWhilePaused(db: any) {
+  while (await isWorkerPaused(db)) {
+    await updateHeartbeat(db, {
+      status: 'paused',
+      current_stage: 'pausado pela interface',
+      current_video: null,
+      progress_percent: 0,
+    })
+
+    if (once) return false
+    await wait(pollMs)
+  }
+
+  return true
+}
+
+async function releaseJobForPause(
+  db: any,
+  job: ProcessingJob,
+  title: string,
+  currentStage: string,
+  currentProgress: number,
+) {
+  const message = `Pausado pela interface em "${currentStage}" (${currentProgress}%). Job devolvido para a fila.`
+
+  await db
+    .from('video_processing_jobs')
+    .update({
+      status: queuedStatusForJob(job),
+      progress: 0,
+      processing_worker_name: null,
+      started_at: null,
+      error_message: message,
+      current_stage: 'aguardando worker: pausado pela interface',
+    })
+    .eq('id', job.id)
+    .eq('status', 'processing')
+    .eq('processing_worker_name', workerName)
+
+  const { data: asset } = await db
+    .from('video_assets')
+    .select('hls_manifest_key')
+    .eq('id', job.video_asset_id)
+    .maybeSingle()
+
+  if (!asset?.hls_manifest_key) {
+    await db
+      .from('video_assets')
+      .update({
+        status: 'uploaded',
+        last_error: null,
+      })
+      .eq('id', job.video_asset_id)
+  }
+
+  await updateHeartbeat(db, {
+    status: 'paused',
+    current_stage: 'pausado pela interface',
+    current_video: null,
+    progress_percent: 0,
+    last_error: null,
   })
 
-  for (const candidate of sortedCandidates) {
-    const { data: claimed, error: claimError } = await db
-      .from('video_processing_jobs')
-      .update({
-        status: 'processing',
-        processing_worker_name: workerName,
-        current_stage: 'reservado pelo worker',
-        started_at: new Date().toISOString(),
-        error_message: null,
-      })
-      .eq('id', candidate.id)
-      .eq('status', queueStatus)
-      .eq('queue_name', queueName)
-      .select('id, video_asset_id, source_key, status, job_type')
-      .maybeSingle()
+  console.log(`[${workerName}] ${message} Video: ${title}`)
+}
 
-    if (claimError) throw claimError
-    if (claimed) return claimed as ProcessingJob
+async function claimNextJob(db: any): Promise<ProcessingJob | null> {
+  if (await isWorkerPaused(db)) return null
+
+  const queuePreferences = workerQueuePreferences()
+
+  if (requeueStale) {
+    const staleBefore = new Date(Date.now() - staleMinutes * 60_000).toISOString()
+    for (const preferredQueue of queuePreferences) {
+      await db
+        .from('video_processing_jobs')
+        .update({
+          status: queuedStatusForQueue(preferredQueue),
+          progress: 0,
+          error_message: `Reenfileirado por ausencia de progresso por ${staleMinutes} minutos.`,
+        })
+        .eq('status', 'processing')
+        .eq('queue_name', preferredQueue)
+        .lt('updated_at', staleBefore)
+    }
+  }
+
+  for (const preferredQueue of queuePreferences) {
+    const preferredStatus = queuedStatusForQueue(preferredQueue)
+    const { data: candidates, error } = await db
+      .from('video_processing_jobs')
+      .select('id, video_asset_id, source_key, status, job_type, created_at, queue_name, video_assets(created_at, processed_at, upload_finished_at)')
+      .eq('status', preferredStatus)
+      .eq('queue_name', preferredQueue)
+      .order('created_at', { ascending: false })
+      .limit(preferredQueue === 'uploads' ? 250 : 10000)
+
+    if (error) throw error
+
+    const sortedCandidates = [...(candidates || [])].sort((a: ProcessingJob, b: ProcessingJob) => {
+      const r2Diff = r2EnteredAt(b) - r2EnteredAt(a)
+      if (r2Diff !== 0) return r2Diff
+      return timeValue(b.created_at) - timeValue(a.created_at)
+    })
+
+    for (const candidate of sortedCandidates) {
+      if (await isWorkerPaused(db)) return null
+
+      const { data: claimed, error: claimError } = await db
+        .from('video_processing_jobs')
+        .update({
+          status: 'processing',
+          processing_worker_name: workerName,
+          started_at: new Date().toISOString(),
+          error_message: null,
+        })
+        .eq('id', candidate.id)
+        .eq('status', preferredStatus)
+        .eq('queue_name', preferredQueue)
+        .select('id, video_asset_id, source_key, status, job_type, queue_name, created_at')
+        .maybeSingle()
+
+      if (claimError) throw claimError
+      if (claimed) return claimed as ProcessingJob
+    }
   }
 
   return null
@@ -182,22 +307,16 @@ async function claimNextJob(db: any): Promise<ProcessingJob | null> {
 async function processJob(db: any, job: ProcessingJob) {
   const { data: asset } = await db
     .from('video_assets')
-    .select('title,status,hls_manifest_key,captions_key,caption_tracks')
+    .select('title')
     .eq('id', job.video_asset_id)
     .maybeSingle()
 
   const title = asset?.title || job.video_asset_id
   console.log(`[${workerName}] processando ${title} (${job.id})`)
-  const storyboardOnly = job.job_type === 'storyboard' || queueName === 'preview'
-  const captionsOnly = !storyboardOnly && (
-    job.job_type === 'captions'
-    || (asset?.hls_manifest_key && !hasCaptionTracks(asset))
-  )
-  let currentStage = storyboardOnly
-    ? 'gerando preview rapido'
-    : captionsOnly
-      ? 'gerando legendas pt-BR, ingles e espanhol'
-      : 'convertendo para HLS'
+  const jobQueueName = job.queue_name || queueName
+  const storyboardOnly = job.job_type === 'storyboard' || jobQueueName === 'preview'
+  const hls720Only = job.job_type === 'hls_720' || jobQueueName === 'hls_720'
+  let currentStage = hls720Only ? 'gerando 720p' : storyboardOnly ? 'gerando preview rapido' : 'convertendo para HLS'
   let currentProgress = 1
   let lastProgressAt = Date.now()
   let exitingForStall = false
@@ -215,7 +334,6 @@ async function processJob(db: any, job: ProcessingJob) {
         .from('video_processing_jobs')
         .update({
           progress: currentProgress,
-          current_stage: currentStage,
           processing_worker_name: workerName,
         })
         .eq('id', job.id)
@@ -234,15 +352,14 @@ async function processJob(db: any, job: ProcessingJob) {
       db
         .from('video_processing_jobs')
         .update({
-          status: queueStatus,
+          status: queuedStatusForJob(job),
           progress: 0,
           processing_worker_name: null,
-          current_stage: 'reenfileirado por worker travado',
           error_message: message,
         })
         .eq('id', job.id)
         .eq('status', 'processing')
-        .eq('queue_name', queueName),
+        .eq('queue_name', job.queue_name || queueName),
       updateHeartbeat(db, {
         status: 'error',
         current_stage: 'reiniciando worker travado',
@@ -266,16 +383,20 @@ async function processJob(db: any, job: ProcessingJob) {
   })
 
   try {
-    const processor = storyboardOnly
-      ? processVideoStoryboardOnly
-      : captionsOnly
-        ? processVideoCaptionsOnly
+    const processor = hls720Only
+      ? processVideoHls720Variant
+      : storyboardOnly
+        ? processVideoStoryboardOnly
         : processVideoToHls
     await processor({
       assetId: job.video_asset_id,
       jobId: job.id,
       userId: null,
+      shouldAbort: () => isWorkerPaused(db),
       onProgress: async (event) => {
+        if (await isWorkerPaused(db)) {
+          throw new WorkerPauseRequestedError()
+        }
         if (event.progress !== currentProgress || event.stage !== currentStage) {
           lastProgressAt = Date.now()
         }
@@ -289,6 +410,12 @@ async function processJob(db: any, job: ProcessingJob) {
         })
       },
     })
+  } catch (error) {
+    if (isPauseRequestedError(error) || await isWorkerPaused(db)) {
+      await releaseJobForPause(db, job, title, currentStage, currentProgress)
+      throw new WorkerPauseRequestedError()
+    }
+    throw error
   } finally {
     clearTimers()
   }
@@ -298,12 +425,19 @@ async function processJob(db: any, job: ProcessingJob) {
 
 async function workerSlot(db: any, slot: number) {
   while (true) {
+    if (await isWorkerPaused(db)) return
+
     const job = await claimNextJob(db)
     if (!job) return
 
     try {
       await processJob(db, job)
     } catch (error) {
+      if (isPauseRequestedError(error)) {
+        console.log(`[${workerName}] slot ${slot} pausado pela interface`)
+        return
+      }
+
       const message = error instanceof Error ? error.message : String(error)
       console.error(`[${workerName}] erro no slot ${slot}: ${message}`)
       await updateHeartbeat(db, {
@@ -328,6 +462,7 @@ async function main() {
     queueName,
     queueStatus,
     queueLabel,
+    queuePreferences: workerQueuePreferences(),
     concurrency,
     pollMs,
     heartbeatMs,
@@ -336,23 +471,12 @@ async function main() {
     jobStallMinutes,
     requeueStale,
     once,
-    pauseLegacyForUploads,
+    prioritizeUploads,
   }))
 
   while (true) {
-    if (queueName === 'legacy' && pauseLegacyForUploads) {
-      const activeUploads = await countActiveUploadJobs(db)
-      if (activeUploads > 0) {
-        await updateHeartbeat(db, {
-          status: 'idle',
-          current_stage: `aguardando uploads novos (${activeUploads})`,
-          progress_percent: 0,
-        })
-        if (once) break
-        await wait(pollMs)
-        continue
-      }
-    }
+    const canRun = await waitWhilePaused(db)
+    if (!canRun) break
 
     await updateHeartbeat(db, {
       status: 'running',
@@ -361,6 +485,17 @@ async function main() {
     })
 
     await Promise.all(Array.from({ length: concurrency }, (_, index) => workerSlot(db, index + 1)))
+
+    if (await isWorkerPaused(db)) {
+      await updateHeartbeat(db, {
+        status: 'paused',
+        current_stage: 'pausado pela interface',
+        current_video: null,
+        progress_percent: 0,
+      })
+      if (once) break
+      continue
+    }
 
     await updateHeartbeat(db, {
       status: 'idle',

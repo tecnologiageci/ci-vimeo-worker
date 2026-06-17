@@ -1,16 +1,17 @@
 import path from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { createSupabaseAdmin } from '@/lib/supabase/admin'
 import {
-  downloadObjectToFileWithProgress,
+  downloadObjectToFile,
+  getObjectText,
   guessContentType,
-  headR2Object,
+  uploadBufferToR2,
+  sanitizeFileSegment,
   uploadFileToR2,
   writeJsonMetadata,
-  type R2DownloadProgress,
 } from './r2'
 import { buildStoryboardPlan, type StoryboardPlan } from './storyboard'
 import type { VideoAsset } from './types'
@@ -20,32 +21,58 @@ interface RunResult {
   stderr: string
 }
 
-type GeneratedCaptionTrack = {
-  language: string
-  label: string
-  path: string
-  default?: boolean
-  source?: string | null
+type AbortSignalCheck = () => boolean | Promise<boolean>
+
+type MediaMetadata = {
+  duration_seconds: number | null
+  width: number | null
+  height: number | null
 }
 
-type StoredCaptionTrack = {
-  language: string
+type HlsOutputVariant = {
   label: string
-  key: string
-  default: boolean
-  source?: string | null
-  generated_at: string
+  directory: string
+  playlist: string
+  width: number | null
+  height: number | null
+  bandwidth: number
 }
 
-const CAPTION_AUDIO_FILE_NAME = 'caption-audio.wav'
+export class VideoProcessingCancelledError extends Error {
+  constructor(message = 'Processamento pausado pela interface.') {
+    super(message)
+    this.name = 'VideoProcessingCancelledError'
+  }
+}
 
-function captionAudioKeyFromPrefix(outputPrefix: string) {
-  return `${outputPrefix}/captions/${CAPTION_AUDIO_FILE_NAME}`
+function isVideoProcessingCancelled(error: unknown) {
+  return error instanceof VideoProcessingCancelledError
+    || (error instanceof Error && error.name === 'VideoProcessingCancelledError')
+}
+
+async function throwIfAbortRequested(shouldAbort?: AbortSignalCheck) {
+  if (!shouldAbort) return
+  if (await shouldAbort()) throw new VideoProcessingCancelledError()
+}
+
+function resolveBinary(command: 'ffmpeg' | 'ffprobe') {
+  const envKey = command === 'ffmpeg' ? 'VIDEO_FFMPEG_PATH' : 'VIDEO_FFPROBE_PATH'
+  const configured = process.env[envKey]?.trim()
+  if (configured) return configured
+
+  const commonPaths = [
+    `/opt/homebrew/bin/${command}`,
+    `/usr/local/bin/${command}`,
+    `/usr/bin/${command}`,
+    `C:\\ffmpeg\\bin\\${command}.exe`,
+  ]
+  return commonPaths.find((candidate) => existsSync(candidate)) || command
 }
 
 function runCommand(command: string, args: string[], cwd?: string): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    const binary = command === 'ffmpeg' || command === 'ffprobe' ? resolveBinary(command) : command
+    const child = spawn(binary, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
 
@@ -61,252 +88,6 @@ function runCommand(command: string, args: string[], cwd?: string): Promise<RunR
       else reject(new Error(`${command} saiu com código ${code}: ${stderr || stdout}`))
     })
   })
-}
-
-function envFlag(name: string, fallback = false) {
-  const value = (process.env[name] || '').trim().toLowerCase()
-  if (!value) return fallback
-  return ['1', 'true', 'yes', 'sim', 'on'].includes(value)
-}
-
-function envText(name: string, fallback: string) {
-  const value = process.env[name]
-  return value == null || value.trim() === '' ? fallback : value.trim()
-}
-
-function boundedPercent(value: number) {
-  return Math.max(0, Math.min(100, Math.round(Number.isFinite(value) ? value : 0)))
-}
-
-function rangedPercent(value: number, start: number, end: number) {
-  if (end <= start) return boundedPercent(value)
-  return boundedPercent(((value - start) / (end - start)) * 100)
-}
-
-function finiteNumber(value: unknown) {
-  const number = Number(value)
-  return Number.isFinite(number) ? number : null
-}
-
-function formatClockDuration(value: number) {
-  const total = Math.max(0, Math.floor(value))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-  }
-  return `${minutes}:${String(seconds).padStart(2, '0')}`
-}
-
-function normalizeStageText(value: string) {
-  return value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-}
-
-function mapCaptionProgress(stage: string, progress: number, details?: Record<string, unknown>) {
-  const normalized = normalizeStageText(stage)
-
-  if (normalized.includes('extraindo audio')) {
-    return { stage: 'Extraindo áudio da legenda', progress: boundedPercent(progress) }
-  }
-  if (normalized.includes('carregando whisper')) {
-    return { stage: 'Carregando IA de legenda', progress: 1 }
-  }
-  if (normalized.includes('transcrevendo')) {
-    const transcribedSeconds = finiteNumber(details?.transcribed_seconds ?? details?.transcribedSeconds)
-    const durationSeconds = finiteNumber(details?.duration_seconds ?? details?.durationSeconds)
-    const captionProgress = Math.max(1, rangedPercent(progress, 5, 50))
-    const suffix = durationSeconds && durationSeconds > 0 && transcribedSeconds != null
-      ? ` · ${formatClockDuration(transcribedSeconds)} de ${formatClockDuration(durationSeconds)} transcritos`
-      : ''
-    return { stage: `Gerando legenda PT-BR${suffix}`, progress: captionProgress }
-  }
-  if (normalized.includes('carregando traducao')) {
-    const language = normalized.includes('es') && !normalized.includes('mul-en') ? 'ES' : 'EN'
-    return { stage: `Carregando tradução ${language}`, progress: 0 }
-  }
-  if (normalized.includes('ingles')) {
-    return { stage: 'Traduzindo legenda EN', progress: rangedPercent(progress, 55, 72) }
-  }
-  if (normalized.includes('espanhol')) {
-    return { stage: 'Traduzindo legenda ES', progress: rangedPercent(progress, 74, 92) }
-  }
-  if (normalized.includes('legendas prontas')) {
-    return { stage: 'Legendas prontas', progress: 100 }
-  }
-
-  return { stage: stage || 'Gerando legendas', progress: boundedPercent(progress) }
-}
-
-function resolveCaptionPython() {
-  return (process.env.VIDEO_CAPTIONS_PYTHON || process.env.PYTHON || 'python').trim()
-}
-
-function resolveCaptionScript() {
-  const configured = process.env.VIDEO_CAPTIONS_SCRIPT?.trim()
-  return configured || path.join(process.cwd(), 'scripts', 'generate-video-captions.py')
-}
-
-function runCaptionGenerator(args: {
-  sourcePath: string
-  outputDir: string
-  resultJson: string
-  onProgress?: (stage: string, progress: number) => void
-}): Promise<{ tracks: GeneratedCaptionTrack[] }> {
-  return new Promise((resolve, reject) => {
-    const childArgs = [
-      resolveCaptionScript(),
-      '--source', args.sourcePath,
-      '--output-dir', args.outputDir,
-      '--result-json', args.resultJson,
-      '--model', process.env.VIDEO_CAPTIONS_MODEL || 'large-v3-turbo',
-      '--device', process.env.VIDEO_CAPTIONS_DEVICE || 'cuda',
-      '--compute-type', process.env.VIDEO_CAPTIONS_COMPUTE_TYPE || 'float16',
-      '--language', process.env.VIDEO_CAPTIONS_SOURCE_LANGUAGE || 'pt',
-      process.env.VIDEO_CAPTIONS_TRANSLATE === '0' ? '--no-translate' : '--translate',
-      '--translation-device', process.env.VIDEO_CAPTIONS_TRANSLATION_DEVICE || 'cpu',
-      '--pt-en-model', process.env.VIDEO_CAPTIONS_PT_EN_MODEL || 'Helsinki-NLP/opus-mt-mul-en',
-      '--pt-es-model', process.env.VIDEO_CAPTIONS_PT_ES_MODEL || '',
-      '--en-es-model', process.env.VIDEO_CAPTIONS_EN_ES_MODEL || 'Helsinki-NLP/opus-mt-en-es',
-    ]
-
-    const child = spawn(resolveCaptionPython(), childArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
-    let stdout = ''
-    let stderr = ''
-    let progressBuffer = ''
-
-    child.stdout.on('data', (chunk) => {
-      const text = chunk.toString()
-      stdout += text
-      progressBuffer += text
-      const lines = progressBuffer.split(/\r?\n/)
-      progressBuffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (!line.trim()) continue
-        try {
-          const event = JSON.parse(line)
-          if (event.type === 'progress') {
-            const rawProgress = Number(event.progress || 0)
-            const mapped = mapCaptionProgress(String(event.stage || 'gerando legendas'), rawProgress, event)
-            args.onProgress?.(mapped.stage, mapped.progress)
-          }
-        } catch {
-          /* stdout pode conter avisos das libs Python */
-        }
-      }
-    })
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString()
-    })
-    child.on('error', reject)
-    child.on('close', async (code) => {
-      if (code !== 0) {
-        reject(new Error(`gerador de legendas saiu com código ${code}: ${stderr || stdout}`))
-        return
-      }
-
-      try {
-        const raw = await readFile(args.resultJson, 'utf8')
-        resolve(JSON.parse(raw))
-      } catch (error) {
-        reject(new Error(`gerador de legendas nao retornou JSON valido: ${error instanceof Error ? error.message : error}`))
-      }
-    })
-  })
-}
-
-async function generateAndUploadCaptionTracks(args: {
-  sourcePath: string
-  tempDir: string
-  outputPrefix: string
-  bucket: string | null
-  resultDirName?: string
-  onProgress?: (stage: string, progress: number) => void | Promise<void>
-}) {
-  const captionsDir = path.join(args.tempDir, args.resultDirName || 'captions')
-  const captionsResultJson = path.join(captionsDir, 'captions-result.json')
-  await mkdir(captionsDir, { recursive: true })
-
-  const captionsResult = await runCaptionGenerator({
-    sourcePath: args.sourcePath,
-    outputDir: captionsDir,
-    resultJson: captionsResultJson,
-    onProgress: (stage, progress) => {
-      Promise.resolve(args.onProgress?.(stage, progress)).catch(() => undefined)
-    },
-  })
-
-  const generatedAt = new Date().toISOString()
-  const captionTracks: StoredCaptionTrack[] = []
-  for (const track of captionsResult.tracks || []) {
-    if (!track.path || !track.language) continue
-    const fileName = path.basename(track.path)
-    const key = `${args.outputPrefix}/captions/${fileName}`
-    await uploadFileToR2(track.path, key, 'text/vtt; charset=utf-8', args.bucket)
-    captionTracks.push({
-      language: track.language,
-      label: track.label || track.language,
-      key,
-      default: Boolean(track.default),
-      source: track.source || null,
-      generated_at: generatedAt,
-    })
-  }
-
-  const primaryCaptionsKey = captionTracks.find((track) => track.language === 'pt-BR')?.key || captionTracks[0]?.key || null
-  return { captionTracks, primaryCaptionsKey }
-}
-
-async function enqueueCaptionJob(args: {
-  assetId: string
-  sourceKey: string | null
-  outputPrefix: string
-  createdBy: string | null
-}) {
-  const db = createSupabaseAdmin()
-  if (!db) throw new Error('Supabase não configurado.')
-
-  const captionQueueName = envText('VIDEO_CAPTIONS_QUEUE_NAME', 'legacy')
-  const captionQueueStatus = envText(
-    'VIDEO_CAPTIONS_QUEUE_STATUS',
-    captionQueueName === 'legacy' ? 'queued_legacy' : 'queued',
-  )
-
-  const { data: existing, error: existingError } = await db
-    .from('video_processing_jobs')
-    .select('id')
-    .eq('video_asset_id', args.assetId)
-    .eq('job_type', 'captions')
-    .in('status', ['queued', 'queued_legacy', 'processing'])
-    .limit(1)
-    .maybeSingle()
-
-  if (existingError) throw existingError
-  if (existing?.id) return existing
-
-  const { data, error } = await db
-    .from('video_processing_jobs')
-    .insert({
-      video_asset_id: args.assetId,
-      job_type: 'captions',
-      status: captionQueueStatus,
-      queue_name: captionQueueName,
-      progress: 0,
-      source_key: args.sourceKey,
-      output_prefix: args.outputPrefix,
-      current_stage: 'Aguardando legenda',
-      created_by: args.createdBy,
-    })
-    .select('id')
-    .single()
-
-  if (error) throw error
-  return data
 }
 
 function secondsFromFfmpegProgress(line: string) {
@@ -327,60 +108,246 @@ function secondsFromFfmpegProgress(line: string) {
   return null
 }
 
-function runFfmpegHls(args: {
+function hlsVideoEncodingArgs() {
+  const encoder = (process.env.VIDEO_HLS_ENCODER || 'libx264').trim().toLowerCase()
+  if (encoder === 'nvenc' || encoder === 'h264_nvenc') {
+    return [
+      '-c:v', 'h264_nvenc',
+      '-preset', process.env.VIDEO_HLS_NVENC_PRESET || 'p4',
+      '-cq', process.env.VIDEO_HLS_NVENC_CQ || '23',
+      '-b:v', '0',
+    ]
+  }
+
+  return [
+    '-c:v', 'libx264',
+    '-preset', process.env.VIDEO_HLS_X264_PRESET || 'veryfast',
+    '-crf', process.env.VIDEO_HLS_X264_CRF || '23',
+  ]
+}
+
+function hlsMaxHeight() {
+  const configured = Number(process.env.VIDEO_HLS_MAX_HEIGHT || 720)
+  return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 720
+}
+
+function evenDimension(value: number) {
+  const rounded = Math.max(2, Math.round(value))
+  return rounded % 2 === 0 ? rounded : rounded - 1
+}
+
+function estimateVariantBandwidth(height: number | null, width: number | null) {
+  if (!height || !width) return 2_800_000
+  if (height >= 1000 || width >= 1900) return 5_500_000
+  if (height >= 700 || width >= 1200) return 2_800_000
+  if (height >= 530 || width >= 900) return 1_800_000
+  if (height >= 470 || width >= 800) return 1_250_000
+  if (height >= 350 || width >= 600) return 850_000
+  return 500_000
+}
+
+function buildHlsOutputVariant(metadata: MediaMetadata): HlsOutputVariant {
+  const maxHeight = hlsMaxHeight()
+  const sourceWidth = Number(metadata.width || 0) || null
+  const sourceHeight = Number(metadata.height || 0) || null
+
+  if (!sourceWidth || !sourceHeight) {
+    return {
+      label: `${maxHeight}p`,
+      directory: `${maxHeight}p`,
+      playlist: `${maxHeight}p/index.m3u8`,
+      width: null,
+      height: maxHeight,
+      bandwidth: estimateVariantBandwidth(maxHeight, null),
+    }
+  }
+
+  const outputHeight = evenDimension(Math.min(sourceHeight, maxHeight))
+  const outputWidth = evenDimension((sourceWidth * outputHeight) / sourceHeight)
+  const label = `${outputHeight}p`
+
+  return {
+    label,
+    directory: label,
+    playlist: `${label}/index.m3u8`,
+    width: outputWidth,
+    height: outputHeight,
+    bandwidth: estimateVariantBandwidth(outputHeight, outputWidth),
+  }
+}
+
+function build720OutputVariant(metadata: MediaMetadata): HlsOutputVariant {
+  const sourceWidth = Number(metadata.width || 0) || null
+  const sourceHeight = Number(metadata.height || 0) || null
+
+  if (!sourceWidth || !sourceHeight) {
+    return {
+      label: '720p',
+      directory: '720p',
+      playlist: '720p/index.m3u8',
+      width: null,
+      height: 720,
+      bandwidth: estimateVariantBandwidth(720, null),
+    }
+  }
+
+  const outputHeight = evenDimension(Math.min(sourceHeight, 720))
+  const outputWidth = evenDimension((sourceWidth * outputHeight) / sourceHeight)
+  const label = `${outputHeight}p`
+
+  return {
+    label,
+    directory: label,
+    playlist: `${label}/index.m3u8`,
+    width: outputWidth,
+    height: outputHeight,
+    bandwidth: estimateVariantBandwidth(outputHeight, outputWidth),
+  }
+}
+
+function hlsScaleFilter() {
+  const maxHeight = hlsMaxHeight()
+  return `scale=-2:'trunc(min(${maxHeight},ih)/2)*2'`
+}
+
+function buildMasterPlaylist(variants: HlsOutputVariant[]) {
+  const lines = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-INDEPENDENT-SEGMENTS',
+  ]
+
+  for (const variant of variants) {
+    const attrs = [
+      `BANDWIDTH=${variant.bandwidth}`,
+      `AVERAGE-BANDWIDTH=${Math.round(variant.bandwidth * 0.82)}`,
+      `NAME="${variant.label}"`,
+    ]
+    if (variant.width && variant.height) attrs.push(`RESOLUTION=${variant.width}x${variant.height}`)
+    lines.push(`#EXT-X-STREAM-INF:${attrs.join(',')}`)
+    lines.push(variant.playlist)
+  }
+
+  return `${lines.join('\n')}\n`
+}
+
+function buildVariantStreamInfo(variant: HlsOutputVariant) {
+  const attrs = [
+    `BANDWIDTH=${variant.bandwidth}`,
+    `AVERAGE-BANDWIDTH=${Math.round(variant.bandwidth * 0.82)}`,
+    `NAME="${variant.label}"`,
+  ]
+  if (variant.width && variant.height) attrs.push(`RESOLUTION=${variant.width}x${variant.height}`)
+  return [`#EXT-X-STREAM-INF:${attrs.join(',')}`, variant.playlist]
+}
+
+function appendVariantToMasterPlaylist(master: string, variant: HlsOutputVariant) {
+  const trimmed = master.trimEnd()
+  if (trimmed.includes(variant.playlist)) return `${trimmed}\n`
+  return `${trimmed}\n${buildVariantStreamInfo(variant).join('\n')}\n`
+}
+
+function buildLegacyMasterPlaylist(args: {
+  originalLabel: string
+  originalPlaylist: string
+  originalWidth: number | null
+  originalHeight: number | null
+  variant: HlsOutputVariant
+}) {
+  return `${[
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-INDEPENDENT-SEGMENTS',
+    ...buildVariantStreamInfo({
+      label: args.originalLabel,
+      directory: '',
+      playlist: args.originalPlaylist,
+      width: args.originalWidth,
+      height: args.originalHeight,
+      bandwidth: estimateVariantBandwidth(args.originalHeight, args.originalWidth),
+    }),
+    ...buildVariantStreamInfo(args.variant),
+  ].join('\n')}\n`
+}
+
+async function runFfmpegHls(args: {
   sourcePath: string
   hlsDir: string
+  metadata: MediaMetadata
   durationSeconds: number | null
   jobId: string
   onProgress?: (progress: number) => void
+  shouldAbort?: AbortSignalCheck
 }): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    const encoder = (process.env.VIDEO_HLS_ENCODER || 'libx264').trim().toLowerCase()
-    const videoEncodingArgs = encoder === 'nvenc' || encoder === 'h264_nvenc'
-      ? [
-          '-c:v', 'h264_nvenc',
-          '-preset', process.env.VIDEO_HLS_NVENC_PRESET || 'p4',
-          '-cq', process.env.VIDEO_HLS_NVENC_CQ || '23',
-          '-b:v', '0',
-        ]
-      : [
-          '-c:v', 'libx264',
-          '-preset', process.env.VIDEO_HLS_X264_PRESET || 'veryfast',
-          '-crf', process.env.VIDEO_HLS_X264_CRF || '23',
-        ]
+  const variant = buildHlsOutputVariant(args.metadata)
+  const variantDir = path.join(args.hlsDir, variant.directory)
+  await mkdir(variantDir, { recursive: true })
 
-    const child = spawn('ffmpeg', [
+  return new Promise((resolve, reject) => {
+    const videoEncodingArgs = hlsVideoEncodingArgs()
+    const child = spawn(resolveBinary('ffmpeg'), [
       '-y',
       '-i', args.sourcePath,
       '-map', '0:v:0',
       '-map', '0:a?',
+      '-vf', hlsScaleFilter(),
       ...videoEncodingArgs,
+      '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-hls_time', '8',
       '-hls_playlist_type', 'vod',
-      '-hls_segment_filename', path.join(args.hlsDir, 'segment-%05d.ts'),
+      '-hls_segment_filename', path.join(variantDir, 'segment-%05d.ts'),
       '-progress', 'pipe:1',
       '-nostats',
-      path.join(args.hlsDir, 'index.m3u8'),
+      path.join(variantDir, 'index.m3u8'),
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
 
     let stdout = ''
     let stderr = ''
     let progressBuffer = ''
-    let lastPersistedProgress = -1
+    let lastPersistedProgress = 36
     let lastPersistedAt = 0
+    let aborting = false
+    let abortKillTimer: NodeJS.Timeout | null = null
+
+    const requestAbortIfNeeded = async () => {
+      if (!args.shouldAbort || aborting) return
+      try {
+        if (!(await args.shouldAbort())) return
+        aborting = true
+        child.kill('SIGTERM')
+        abortKillTimer = setTimeout(() => {
+          if (!child.killed) child.kill('SIGKILL')
+        }, 5000)
+      } catch {
+        /* falha ao consultar pausa nao deve derrubar o ffmpeg */
+      }
+    }
+
+    const abortTimer = args.shouldAbort
+      ? setInterval(() => {
+        void requestAbortIfNeeded()
+      }, 2000)
+      : null
+    void requestAbortIfNeeded()
+
+    const clearAbortTimers = () => {
+      if (abortTimer) clearInterval(abortTimer)
+      if (abortKillTimer) clearTimeout(abortKillTimer)
+    }
 
     const persistProgress = (progress: number) => {
       const now = Date.now()
-      const bounded = boundedPercent(progress)
+      const bounded = Math.max(37, Math.min(74, Math.round(progress)))
       if (bounded <= lastPersistedProgress) return
       if (bounded - lastPersistedProgress < 2 && now - lastPersistedAt < 1800) return
 
       lastPersistedProgress = bounded
       lastPersistedAt = now
-      updateJob(args.jobId, { progress: bounded, current_stage: 'Convertendo vídeo HLS' }).catch(() => undefined)
+      updateJob(args.jobId, { progress: bounded }).catch(() => undefined)
       args.onProgress?.(bounded)
+      void requestAbortIfNeeded()
     }
 
     child.stdout.on('data', (chunk) => {
@@ -393,17 +360,134 @@ function runFfmpegHls(args: {
       for (const line of lines) {
         const elapsed = secondsFromFfmpegProgress(line)
         if (elapsed == null || !args.durationSeconds) continue
-        persistProgress((elapsed / args.durationSeconds) * 100)
+        persistProgress(36 + (elapsed / args.durationSeconds) * 38)
       }
     })
 
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString()
     })
-    child.on('error', reject)
+    child.on('error', (error) => {
+      clearAbortTimers()
+      reject(aborting ? new VideoProcessingCancelledError() : error)
+    })
     child.on('close', (code) => {
-      if (code === 0) resolve({ stdout, stderr })
+      clearAbortTimers()
+      if (aborting) return reject(new VideoProcessingCancelledError())
+      if (code === 0) {
+        writeFile(path.join(args.hlsDir, 'index.m3u8'), buildMasterPlaylist([variant]), 'utf8')
+          .then(() => resolve({ stdout, stderr }))
+          .catch(reject)
+        return
+      }
       else reject(new Error(`ffmpeg saiu com código ${code}: ${stderr || stdout}`))
+    })
+  })
+}
+
+async function runFfmpegHls720Variant(args: {
+  sourcePath: string
+  variantDir: string
+  durationSeconds: number | null
+  jobId: string
+  onProgress?: (progress: number) => void
+  shouldAbort?: AbortSignalCheck
+}): Promise<RunResult> {
+  await mkdir(args.variantDir, { recursive: true })
+
+  return new Promise((resolve, reject) => {
+    const videoEncodingArgs = hlsVideoEncodingArgs()
+    const child = spawn(resolveBinary('ffmpeg'), [
+      '-y',
+      '-i', args.sourcePath,
+      '-map', '0:v:0',
+      '-map', '0:a?',
+      '-vf', "scale=-2:'trunc(min(720,ih)/2)*2'",
+      ...videoEncodingArgs,
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-hls_time', '8',
+      '-hls_playlist_type', 'vod',
+      '-hls_segment_filename', path.join(args.variantDir, 'segment-%05d.ts'),
+      '-progress', 'pipe:1',
+      '-nostats',
+      path.join(args.variantDir, 'index.m3u8'),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    let stdout = ''
+    let stderr = ''
+    let progressBuffer = ''
+    let lastPersistedProgress = 30
+    let lastPersistedAt = 0
+    let aborting = false
+    let abortKillTimer: NodeJS.Timeout | null = null
+
+    const requestAbortIfNeeded = async () => {
+      if (!args.shouldAbort || aborting) return
+      try {
+        if (!(await args.shouldAbort())) return
+        aborting = true
+        child.kill('SIGTERM')
+        abortKillTimer = setTimeout(() => {
+          if (!child.killed) child.kill('SIGKILL')
+        }, 5000)
+      } catch {
+        /* falha ao consultar pausa nao deve derrubar o ffmpeg */
+      }
+    }
+
+    const abortTimer = args.shouldAbort
+      ? setInterval(() => {
+        void requestAbortIfNeeded()
+      }, 2000)
+      : null
+    void requestAbortIfNeeded()
+
+    const clearAbortTimers = () => {
+      if (abortTimer) clearInterval(abortTimer)
+      if (abortKillTimer) clearTimeout(abortKillTimer)
+    }
+
+    const persistProgress = (progress: number) => {
+      const now = Date.now()
+      const bounded = Math.max(31, Math.min(82, Math.round(progress)))
+      if (bounded <= lastPersistedProgress) return
+      if (bounded - lastPersistedProgress < 2 && now - lastPersistedAt < 1800) return
+
+      lastPersistedProgress = bounded
+      lastPersistedAt = now
+      updateJob(args.jobId, { progress: bounded }).catch(() => undefined)
+      args.onProgress?.(bounded)
+      void requestAbortIfNeeded()
+    }
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString()
+      stdout += text
+      progressBuffer += text
+      const lines = progressBuffer.split(/\r?\n/)
+      progressBuffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const elapsed = secondsFromFfmpegProgress(line)
+        if (elapsed == null || !args.durationSeconds) continue
+        persistProgress(30 + (elapsed / args.durationSeconds) * 52)
+      }
+    })
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on('error', (error) => {
+      clearAbortTimers()
+      reject(aborting ? new VideoProcessingCancelledError() : error)
+    })
+    child.on('close', (code) => {
+      clearAbortTimers()
+      if (aborting) return reject(new VideoProcessingCancelledError())
+      if (code === 0) return resolve({ stdout, stderr })
+      reject(new Error(`ffmpeg saiu com código ${code}: ${stderr || stdout}`))
     })
   })
 }
@@ -419,51 +503,6 @@ async function updateAsset(assetId: string, patch: Record<string, unknown>, opti
   if (!db) return
   const { error } = await db.from('video_assets').update(patch).eq('id', assetId)
   if (error && !options?.ignoreError) throw error
-}
-
-function createDownloadProgressReporter(
-  jobId: string,
-  stage: string,
-  notifyProgress: (stage: string, progress: number) => Promise<void>,
-) {
-  let lastProgress = -1
-  let lastPersistedAt = 0
-
-  return (event: R2DownloadProgress) => {
-    const progress = boundedPercent(event.percent ?? 0)
-    const now = Date.now()
-    if (progress <= lastProgress && now - lastPersistedAt < 5000) return
-    if (progress < 100 && progress - lastProgress < 2 && now - lastPersistedAt < 2500) return
-
-    lastProgress = progress
-    lastPersistedAt = now
-    updateJob(jobId, { progress, current_stage: stage }).catch(() => undefined)
-    notifyProgress(stage, progress).catch(() => undefined)
-  }
-}
-
-function createRangedDownloadProgressReporter(
-  jobId: string,
-  stage: string,
-  notifyProgress: (stage: string, progress: number) => Promise<void>,
-  start: number,
-  end: number,
-) {
-  let lastProgress = -1
-  let lastPersistedAt = 0
-
-  return (event: R2DownloadProgress) => {
-    const rawProgress = boundedPercent(event.percent ?? 0)
-    const progress = boundedPercent(start + (rawProgress / 100) * (end - start))
-    const now = Date.now()
-    if (progress <= lastProgress && now - lastPersistedAt < 5000) return
-    if (progress < end && progress - lastProgress < 2 && now - lastPersistedAt < 2500) return
-
-    lastProgress = progress
-    lastPersistedAt = now
-    updateJob(jobId, { progress, current_stage: stage }).catch(() => undefined)
-    notifyProgress(stage, progress).catch(() => undefined)
-  }
 }
 
 async function listFilesRecursive(dir: string): Promise<string[]> {
@@ -499,42 +538,28 @@ async function readMediaMetadata(sourcePath: string) {
   }
 }
 
-async function r2ObjectExists(key: string, bucket: string | null) {
-  try {
-    await headR2Object(key, bucket)
-    return true
-  } catch {
-    return false
-  }
+function extensionForContentType(contentType: string | null | undefined) {
+  const lower = (contentType || '').toLowerCase()
+  if (lower.includes('webm')) return '.webm'
+  if (lower.includes('quicktime') || lower.includes('mov')) return '.mov'
+  return '.mp4'
 }
 
-async function extractCaptionAudio(sourcePath: string, audioPath: string) {
-  await mkdir(path.dirname(audioPath), { recursive: true })
-  await runCommand('ffmpeg', [
-    '-y',
-    '-nostdin',
-    '-hide_banner',
-    '-loglevel', 'error',
-    '-i', sourcePath,
-    '-vn',
-    '-ac', '1',
-    '-ar', '16000',
-    '-c:a', 'pcm_s16le',
-    audioPath,
-  ])
+function dirnameFromR2Key(key: string | null | undefined) {
+  if (!key) return null
+  const normalized = key.replace(/\\/g, '/')
+  const index = normalized.lastIndexOf('/')
+  return index >= 0 ? normalized.slice(0, index) : normalized
 }
 
-async function generateAndUploadCaptionAudio(args: {
-  sourcePath: string
-  tempDir: string
-  outputPrefix: string
-  bucket: string | null
-}) {
-  const key = captionAudioKeyFromPrefix(args.outputPrefix)
-  const audioPath = path.join(args.tempDir, CAPTION_AUDIO_FILE_NAME)
-  await extractCaptionAudio(args.sourcePath, audioPath)
-  await uploadFileToR2(audioPath, key, 'audio/wav', args.bucket)
-  return key
+function buildLocalSourceFileName(video: VideoAsset) {
+  const sourceName = video.source_file_name || path.basename(video.source_key || '') || `video-${video.id}`
+  const rawExt = path.extname(sourceName)
+  const hasUsableExtension = Boolean(rawExt && rawExt !== '.')
+  const baseName = hasUsableExtension ? path.basename(sourceName, rawExt) : sourceName
+  const base = sanitizeFileSegment(baseName)
+  const ext = hasUsableExtension ? rawExt.toLowerCase() : extensionForContentType(video.source_content_type)
+  return `${base}${ext}`
 }
 
 async function generatePoster(sourcePath: string, posterPath: string) {
@@ -601,171 +626,11 @@ async function mapWithConcurrency<T>(
   }))
 }
 
-function localSourceExtension(sourceKey: string) {
-  const extension = path.extname(path.basename(sourceKey)).toLowerCase()
-  return /^\.[a-z0-9]{2,8}$/.test(extension) ? extension : '.mp4'
-}
-
-function shouldGenerateStoryboard(video: VideoAsset) {
-  if (!envFlag('VIDEO_STORYBOARD_ENABLED', true)) return false
-
-  const maxSourceMb = Number(process.env.VIDEO_STORYBOARD_MAX_SOURCE_MB || 2048)
-  const sourceSizeBytes = Number(video.source_size_bytes || 0)
-  if (Number.isFinite(maxSourceMb) && maxSourceMb > 0 && sourceSizeBytes > maxSourceMb * 1024 * 1024) {
-    return false
-  }
-
-  return true
-}
-
-function dirnameFromR2Key(key: string | null | undefined) {
-  if (!key) return null
-  const normalized = key.replace(/\\/g, '/')
-  const index = normalized.lastIndexOf('/')
-  return index >= 0 ? normalized.slice(0, index) : normalized
-}
-
-export async function processVideoCaptionsOnly(args: {
-  assetId: string
-  jobId: string
-  userId: string | null
-  onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
-}) {
-  const db = createSupabaseAdmin()
-  if (!db) throw new Error('Supabase não configurado.')
-
-  const { data: asset, error } = await db
-    .from('video_assets')
-    .select('*')
-    .eq('id', args.assetId)
-    .single()
-
-  if (error || !asset) throw new Error(error?.message || 'Vídeo não encontrado.')
-  const video = asset as VideoAsset
-  if (!video.hls_manifest_key) throw new Error('Vídeo ainda não tem HLS pronto.')
-
-  const outputPrefix = video.hls_prefix || dirnameFromR2Key(video.hls_manifest_key) || `videos/${video.id}/hls`
-  const bucket = video.source_bucket || null
-  const preparedAudioKey = captionAudioKeyFromPrefix(outputPrefix)
-  let tempDir: string | null = null
-  let lastPersistedStage = ''
-  let lastPersistedProgress = -1
-  let lastPersistedAt = 0
-
-  const notifyProgress = async (stage: string, progress: number) => {
-    const bounded = boundedPercent(progress)
-    const now = Date.now()
-    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
-      lastPersistedStage = stage
-      lastPersistedProgress = bounded
-      lastPersistedAt = now
-      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
-    }
-    try {
-      await args.onProgress?.({ stage, progress: bounded })
-    } catch {
-      /* progresso externo nao deve quebrar processamento */
-    }
-  }
-
-  await updateJob(args.jobId, {
-    status: 'processing',
-    progress: 0,
-    source_key: video.source_key,
-    output_prefix: outputPrefix,
-    started_at: new Date().toISOString(),
-    current_stage: 'Preparando legendas',
-    error_message: null,
-  })
-  await notifyProgress('Preparando legendas', 0)
-
-  try {
-    tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-captions-'))
-    const hasPreparedAudio = await r2ObjectExists(preparedAudioKey, bucket)
-    const sourcePath = hasPreparedAudio
-      ? path.join(tempDir, CAPTION_AUDIO_FILE_NAME)
-      : path.join(tempDir, `source${localSourceExtension(video.source_key || '')}`)
-
-    if (hasPreparedAudio) {
-      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando áudio leve do R2' })
-      await notifyProgress('Baixando áudio leve do R2', 0)
-      await downloadObjectToFileWithProgress(
-        preparedAudioKey,
-        sourcePath,
-        bucket,
-        createDownloadProgressReporter(args.jobId, 'Baixando áudio leve do R2', notifyProgress),
-      )
-    } else {
-      if (!video.source_key) throw new Error('Vídeo sem arquivo original ou áudio leve no R2.')
-      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
-      await notifyProgress('Baixando original do R2', 0)
-      await downloadObjectToFileWithProgress(
-        video.source_key,
-        sourcePath,
-        bucket,
-        createDownloadProgressReporter(args.jobId, 'Baixando original do R2', notifyProgress),
-      )
-    }
-
-    await updateJob(args.jobId, { progress: 0, current_stage: 'Extraindo áudio da legenda' })
-    await notifyProgress('Extraindo áudio da legenda', 0)
-    const { captionTracks, primaryCaptionsKey } = await generateAndUploadCaptionTracks({
-      sourcePath,
-      tempDir,
-      outputPrefix,
-      bucket,
-      resultDirName: 'captions-only',
-      onProgress: (stage, progress) => {
-        notifyProgress(stage, progress).catch(() => undefined)
-      },
-    })
-
-    if (captionTracks.length === 0 || !primaryCaptionsKey) {
-      throw new Error('Nenhuma legenda foi gerada.')
-    }
-
-    await notifyProgress('Legendas enviadas para R2', 100)
-    await updateAsset(video.id, {
-      captions_key: primaryCaptionsKey,
-      caption_tracks: captionTracks,
-      last_error: null,
-      updated_by: args.userId,
-    })
-
-    await updateJob(args.jobId, {
-      status: 'completed',
-      progress: 100,
-      completed_at: new Date().toISOString(),
-      current_stage: 'Legendas concluídas',
-    })
-    await notifyProgress('Legendas concluídas', 100)
-
-    return { captionTracks }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    await updateJob(args.jobId, {
-      status: 'failed',
-      progress: 100,
-      error_message: message,
-      completed_at: new Date().toISOString(),
-      current_stage: 'erro nas legendas',
-    })
-    await updateAsset(video.id, {
-      last_error: message,
-      updated_by: args.userId,
-    }, { ignoreError: true })
-    throw error
-  } finally {
-    if (tempDir) {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
-    }
-  }
-}
-
 export async function processVideoStoryboardOnly(args: {
   assetId: string
   jobId: string
   userId: string | null
+  shouldAbort?: AbortSignalCheck
   onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
 }) {
   const db = createSupabaseAdmin()
@@ -786,19 +651,11 @@ export async function processVideoStoryboardOnly(args: {
   const storyboardKey = `${outputPrefix}/storyboard.webp`
   const bucket = video.source_bucket || null
   let tempDir: string | null = null
-  let lastPersistedStage = ''
-  let lastPersistedProgress = -1
-  let lastPersistedAt = 0
 
   const notifyProgress = async (stage: string, progress: number) => {
-    const bounded = boundedPercent(progress)
-    const now = Date.now()
-    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
-      lastPersistedStage = stage
-      lastPersistedProgress = bounded
-      lastPersistedAt = now
-      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
-    }
+    await throwIfAbortRequested(args.shouldAbort)
+    const bounded = Math.max(0, Math.min(100, Math.round(progress)))
+    await updateJob(args.jobId, { progress: bounded, current_stage: stage })
     try {
       await args.onProgress?.({ stage, progress: bounded })
     } catch {
@@ -815,20 +672,15 @@ export async function processVideoStoryboardOnly(args: {
     current_stage: 'Preparando preview rapido',
     error_message: null,
   })
-  await notifyProgress('Preparando preview rapido', 0)
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-storyboard-'))
-    const sourcePath = path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
+    const sourcePath = path.join(tempDir, buildLocalSourceFileName(video))
     const storyboardPath = path.join(tempDir, 'storyboard.webp')
 
-    await notifyProgress('Baixando original para preview rapido', 0)
-    await downloadObjectToFileWithProgress(
-      video.source_key,
-      sourcePath,
-      bucket,
-      createRangedDownloadProgressReporter(args.jobId, 'Baixando original para preview rapido', notifyProgress, 0, 25),
-    )
+    await notifyProgress('Baixando original para preview rapido', 10)
+    await downloadObjectToFile(video.source_key, sourcePath, bucket)
+    await throwIfAbortRequested(args.shouldAbort)
 
     await notifyProgress('Lendo metadados do preview rapido', 30)
     const metadata = await readMediaMetadata(sourcePath)
@@ -842,11 +694,13 @@ export async function processVideoStoryboardOnly(args: {
     })
     if (!storyboardPlan) throw new Error('Metadata insuficiente para gerar preview rapido.')
 
-    await notifyProgress('Gerando preview rapido', 35)
+    await notifyProgress('Gerando preview rapido', 55)
     await generateStoryboardStrict(sourcePath, storyboardPath, storyboardPlan)
+    await throwIfAbortRequested(args.shouldAbort)
 
     await notifyProgress('Enviando preview rapido para R2', 90)
     await uploadFileToR2(storyboardPath, storyboardKey, 'image/webp', bucket)
+    await throwIfAbortRequested(args.shouldAbort)
 
     await updateAsset(video.id, {
       storyboard_key: storyboardKey,
@@ -870,6 +724,7 @@ export async function processVideoStoryboardOnly(args: {
 
     return { storyboardKey, storyboard: storyboardPlan, metadata }
   } catch (error) {
+    if (isVideoProcessingCancelled(error)) throw error
     const message = error instanceof Error ? error.message : String(error)
     await updateJob(args.jobId, {
       status: 'failed',
@@ -890,11 +745,182 @@ export async function processVideoStoryboardOnly(args: {
   }
 }
 
+export async function processVideoHls720Variant(args: {
+  assetId: string
+  jobId: string
+  userId: string | null
+  shouldAbort?: AbortSignalCheck
+  onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
+}) {
+  const db = createSupabaseAdmin()
+  if (!db) throw new Error('Supabase não configurado.')
+
+  const { data: asset, error } = await db
+    .from('video_assets')
+    .select('*')
+    .eq('id', args.assetId)
+    .single()
+
+  if (error || !asset) throw new Error(error?.message || 'Vídeo não encontrado.')
+  const video = asset as VideoAsset
+  if (!video.source_key) throw new Error('Vídeo sem arquivo original no R2.')
+  if (!video.hls_manifest_key) throw new Error('Vídeo ainda não tem HLS pronto.')
+
+  const sourceHeight = Number(video.height || 0) || null
+  const sourceWidth = Number(video.width || 0) || null
+  const outputPrefix = video.hls_prefix || dirnameFromR2Key(video.hls_manifest_key) || `videos/${video.id}/hls`
+  const bucket = video.source_bucket || null
+  let tempDir: string | null = null
+
+  const notifyProgress = async (stage: string, progress: number) => {
+    await throwIfAbortRequested(args.shouldAbort)
+    const bounded = Math.max(0, Math.min(100, Math.round(progress)))
+    await updateJob(args.jobId, { progress: bounded, current_stage: stage })
+    try {
+      await args.onProgress?.({ stage, progress: bounded })
+    } catch {
+      /* progresso externo nao deve quebrar processamento */
+    }
+  }
+
+  await updateJob(args.jobId, {
+    status: 'processing',
+    progress: 0,
+    source_key: video.source_key,
+    output_prefix: outputPrefix,
+    started_at: new Date().toISOString(),
+    current_stage: 'Preparando variante 720p',
+    error_message: null,
+  })
+
+  try {
+    await notifyProgress('Lendo playlist HLS atual', 5)
+    const currentManifest = await getObjectText(video.hls_manifest_key, bucket)
+    if (currentManifest.includes('#EXT-X-STREAM-INF') && currentManifest.includes('720p/index.m3u8')) {
+      await updateJob(args.jobId, {
+        status: 'completed',
+        progress: 100,
+        completed_at: new Date().toISOString(),
+        current_stage: '720p ja estava disponivel',
+      })
+      await notifyProgress('720p ja estava disponivel', 100)
+      return { skipped: true, reason: 'ja_tem_720' }
+    }
+
+    if (sourceHeight && sourceHeight <= 720) {
+      await updateJob(args.jobId, {
+        status: 'completed',
+        progress: 100,
+        completed_at: new Date().toISOString(),
+        current_stage: 'Video ja esta em 720p ou menor',
+      })
+      await notifyProgress('Video ja esta em 720p ou menor', 100)
+      return { skipped: true, reason: 'ja_720_ou_menor' }
+    }
+
+    tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-hls-720-'))
+    const sourcePath = path.join(tempDir, buildLocalSourceFileName(video))
+    const variant = build720OutputVariant({
+      duration_seconds: video.duration_seconds,
+      width: sourceWidth,
+      height: sourceHeight,
+    })
+    const variantDir = path.join(tempDir, variant.directory)
+
+    await notifyProgress('Baixando original para gerar 720p', 12)
+    await downloadObjectToFile(video.source_key, sourcePath, bucket)
+    await throwIfAbortRequested(args.shouldAbort)
+
+    await notifyProgress('Convertendo variante 720p', 30)
+    await runFfmpegHls720Variant({
+      sourcePath,
+      variantDir,
+      durationSeconds: video.duration_seconds,
+      jobId: args.jobId,
+      shouldAbort: args.shouldAbort,
+      onProgress: (progress) => {
+        notifyProgress('Convertendo variante 720p', progress).catch(() => undefined)
+      },
+    })
+    await throwIfAbortRequested(args.shouldAbort)
+
+    await notifyProgress('Enviando 720p para R2', 84)
+    const variantFiles = await listFilesRecursive(variantDir)
+    let uploadedFiles = 0
+    const uploadConcurrency = Math.max(1, Number(process.env.VIDEO_HLS_UPLOAD_CONCURRENCY || 4))
+    await mapWithConcurrency(variantFiles, uploadConcurrency, async (file) => {
+      const relative = path.relative(tempDir!, file).split(path.sep).join('/')
+      await uploadFileToR2(file, `${outputPrefix}/${relative}`, guessContentType(relative), bucket)
+      uploadedFiles += 1
+      await notifyProgress('Enviando 720p para R2', Math.round(84 + (uploadedFiles / Math.max(variantFiles.length, 1)) * 10))
+    })
+    await throwIfAbortRequested(args.shouldAbort)
+
+    await notifyProgress('Atualizando seletor de qualidade', 96)
+    let nextManifest = ''
+    if (currentManifest.includes('#EXT-X-STREAM-INF')) {
+      nextManifest = appendVariantToMasterPlaylist(currentManifest, variant)
+    } else {
+      const originalHeight = sourceHeight || 1080
+      const originalPlaylist = `${originalHeight}p.m3u8`
+      await uploadBufferToR2(
+        currentManifest,
+        `${outputPrefix}/${originalPlaylist}`,
+        'application/vnd.apple.mpegurl; charset=utf-8',
+        bucket,
+      )
+      nextManifest = buildLegacyMasterPlaylist({
+        originalLabel: `${originalHeight}p`,
+        originalPlaylist,
+        originalWidth: sourceWidth,
+        originalHeight: sourceHeight,
+        variant,
+      })
+    }
+
+    await uploadBufferToR2(nextManifest, video.hls_manifest_key, 'application/vnd.apple.mpegurl; charset=utf-8', bucket)
+
+    await updateAsset(video.id, {
+      last_error: null,
+      updated_by: args.userId,
+    }, { ignoreError: true })
+    await updateJob(args.jobId, {
+      status: 'completed',
+      progress: 100,
+      completed_at: new Date().toISOString(),
+      current_stage: '720p concluido',
+    })
+    await notifyProgress('720p concluido', 100)
+
+    return { skipped: false, reason: 'ok', variant }
+  } catch (error) {
+    if (isVideoProcessingCancelled(error)) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    await updateJob(args.jobId, {
+      status: 'failed',
+      progress: 100,
+      error_message: message,
+      completed_at: new Date().toISOString(),
+      current_stage: 'erro na variante 720p',
+    })
+    await updateAsset(video.id, {
+      last_error: message,
+      updated_by: args.userId,
+    }, { ignoreError: true })
+    throw error
+  } finally {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+}
+
 export async function processVideoToHls(args: {
   assetId: string
   jobId: string
   userId: string | null
   localSourcePath?: string | null
+  shouldAbort?: AbortSignalCheck
   onProgress?: (event: { stage: string; progress: number }) => void | Promise<void>
 }) {
   const db = createSupabaseAdmin()
@@ -917,22 +943,11 @@ export async function processVideoToHls(args: {
   const metadataKey = `${outputPrefix}/metadata.json`
   const bucket = video.source_bucket || null
   let tempDir: string | null = null
-  let hlsPersisted = Boolean(video.hls_manifest_key)
-  let lastPersistedStage = ''
-  let lastPersistedProgress = -1
-  let lastPersistedAt = 0
 
   const notifyProgress = async (stage: string, progress: number) => {
-    const bounded = boundedPercent(progress)
-    const now = Date.now()
-    if (stage !== lastPersistedStage || bounded !== lastPersistedProgress || now - lastPersistedAt > 5000) {
-      lastPersistedStage = stage
-      lastPersistedProgress = bounded
-      lastPersistedAt = now
-      updateJob(args.jobId, { progress: bounded, current_stage: stage }).catch(() => undefined)
-    }
+    await throwIfAbortRequested(args.shouldAbort)
     try {
-      await args.onProgress?.({ stage, progress: bounded })
+      await args.onProgress?.({ stage, progress })
     } catch {
       /* progresso externo nao deve quebrar processamento */
     }
@@ -941,69 +956,66 @@ export async function processVideoToHls(args: {
   await updateAsset(video.id, { status: 'processing', last_error: null, updated_by: args.userId })
   await updateJob(args.jobId, {
     status: 'processing',
-    progress: 0,
+    progress: 5,
     source_key: video.source_key,
     output_prefix: outputPrefix,
     started_at: new Date().toISOString(),
-    current_stage: 'Preparando vídeo',
     error_message: null,
   })
-  await notifyProgress('Preparando vídeo', 0)
+  await notifyProgress('preparando', 5)
 
   try {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'hub-video-'))
-    const sourcePath = args.localSourcePath || path.join(tempDir, `source${localSourceExtension(video.source_key)}`)
+    const sourcePath = args.localSourcePath || path.join(tempDir, buildLocalSourceFileName(video))
     const hlsDir = path.join(tempDir, 'hls')
     const posterPath = path.join(tempDir, 'poster.jpg')
     const storyboardPath = path.join(tempDir, 'storyboard.webp')
 
     if (args.localSourcePath) {
-      await updateJob(args.jobId, { progress: 100, current_stage: 'Usando original temporário' })
-      await notifyProgress('Usando original temporário', 100)
+      await updateJob(args.jobId, { progress: 18 })
+      await notifyProgress('usando original temporario', 18)
     } else {
-      await updateJob(args.jobId, { progress: 0, current_stage: 'Baixando original do R2' })
-      await notifyProgress('Baixando original do R2', 0)
-      await downloadObjectToFileWithProgress(
-        video.source_key,
-        sourcePath,
-        bucket,
-        createDownloadProgressReporter(args.jobId, 'Baixando original do R2', notifyProgress),
-      )
+      await updateJob(args.jobId, { progress: 12 })
+      await notifyProgress('baixando original do R2', 12)
+      await downloadObjectToFile(video.source_key, sourcePath, bucket)
+      await throwIfAbortRequested(args.shouldAbort)
     }
 
-    await updateJob(args.jobId, { progress: 0, current_stage: 'Gerando preview rápido' })
-    await notifyProgress('Gerando preview rápido', 0)
+    await updateJob(args.jobId, { progress: 22 })
+    await notifyProgress('lendo metadados', 22)
     const metadata = await readMediaMetadata(sourcePath)
     const posterCreated = await generatePoster(sourcePath, posterPath)
-    const storyboardPlan = shouldGenerateStoryboard(video)
-      ? buildStoryboardPlan({
-          durationSeconds: metadata.duration_seconds,
-          width: metadata.width,
-          height: metadata.height,
-          maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
-          frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
-          columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
-        })
-      : null
+    const storyboardPlan = buildStoryboardPlan({
+      durationSeconds: metadata.duration_seconds,
+      width: metadata.width,
+      height: metadata.height,
+      maxFrames: Number(process.env.VIDEO_STORYBOARD_MAX_FRAMES || 120),
+      frameWidth: Number(process.env.VIDEO_STORYBOARD_FRAME_WIDTH || 240),
+      columns: Number(process.env.VIDEO_STORYBOARD_COLUMNS || 5),
+    })
     const storyboardCreated = storyboardPlan
       ? await generateStoryboard(sourcePath, storyboardPath, storyboardPlan)
       : false
+    await throwIfAbortRequested(args.shouldAbort)
 
-    await updateJob(args.jobId, { progress: 0, current_stage: 'Convertendo vídeo HLS' })
-    await notifyProgress('Convertendo vídeo HLS', 0)
+    await updateJob(args.jobId, { progress: 36 })
+    await notifyProgress('convertendo para HLS', 36)
     await mkdir(hlsDir, { recursive: true })
     await runFfmpegHls({
       sourcePath,
       hlsDir,
+      metadata,
       durationSeconds: metadata.duration_seconds,
       jobId: args.jobId,
+      shouldAbort: args.shouldAbort,
       onProgress: (progress) => {
-        notifyProgress('Convertendo vídeo HLS', progress).catch(() => undefined)
+        notifyProgress('convertendo para HLS', progress).catch(() => undefined)
       },
     })
+    await throwIfAbortRequested(args.shouldAbort)
 
-    await updateJob(args.jobId, { progress: 0, current_stage: 'Enviando HLS para R2' })
-    await notifyProgress('Enviando HLS para R2', 0)
+    await updateJob(args.jobId, { progress: 76 })
+    await notifyProgress('enviando HLS para R2', 76)
     const hlsFiles = await listFilesRecursive(hlsDir)
     let uploadedHlsFiles = 0
     const hlsUploadConcurrency = Math.max(1, Number(process.env.VIDEO_HLS_UPLOAD_CONCURRENCY || 4))
@@ -1011,8 +1023,9 @@ export async function processVideoToHls(args: {
       const relative = path.relative(hlsDir, file).split(path.sep).join('/')
       await uploadFileToR2(file, `${outputPrefix}/${relative}`, guessContentType(relative), bucket)
       uploadedHlsFiles += 1
-      await notifyProgress('Enviando HLS para R2', Math.round((uploadedHlsFiles / Math.max(hlsFiles.length, 1)) * 100))
+      await notifyProgress('enviando HLS para R2', Math.round(76 + (uploadedHlsFiles / Math.max(hlsFiles.length, 1)) * 18))
     })
+    await throwIfAbortRequested(args.shouldAbort)
 
     let finalPosterKey: string | null = null
     if (posterCreated) {
@@ -1024,6 +1037,8 @@ export async function processVideoToHls(args: {
       await uploadFileToR2(storyboardPath, storyboardKey, 'image/webp', bucket)
       finalStoryboardKey = storyboardKey
     }
+    await notifyProgress('finalizando HLS', 96)
+    await throwIfAbortRequested(args.shouldAbort)
 
     await writeJsonMetadata(metadataKey, {
       assetId: video.id,
@@ -1033,104 +1048,14 @@ export async function processVideoToHls(args: {
       posterKey: finalPosterKey,
       storyboardKey: finalStoryboardKey,
       storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
-      captionTracks: [],
-      processedAt: new Date().toISOString(),
-      ...metadata,
-    }, bucket)
-
-    await updateAsset(video.id, {
-      status: 'ready',
-      hls_prefix: outputPrefix,
-      hls_manifest_key: manifestKey,
-      poster_key: finalPosterKey,
-      duration_seconds: metadata.duration_seconds,
-      width: metadata.width,
-      height: metadata.height,
-      processed_at: new Date().toISOString(),
-      last_error: null,
-      updated_by: args.userId,
-    })
-    await updateAsset(video.id, {
-      storyboard_key: finalStoryboardKey,
-      storyboard_interval_seconds: storyboardPlan?.intervalSeconds || null,
-      storyboard_columns: storyboardPlan?.columns || null,
-      storyboard_rows: storyboardPlan?.rows || null,
-      storyboard_frame_width: storyboardPlan?.frameWidth || null,
-      storyboard_frame_height: storyboardPlan?.frameHeight || null,
-      storyboard_frame_count: storyboardPlan?.frameCount || null,
-    }, { ignoreError: true })
-    hlsPersisted = true
-
-    let primaryCaptionsKey: string | null = null
-    let captionTracks: StoredCaptionTrack[] = []
-    const captionsEnabled = envFlag('VIDEO_CAPTIONS_ENABLED', false)
-    const captionsInline = envFlag('VIDEO_CAPTIONS_INLINE', false)
-    let captionAudioKey: string | null = null
-    let captionAudioError: string | null = null
-    if (captionsEnabled) {
-      try {
-        await updateJob(args.jobId, { progress: 100, current_stage: 'Extraindo áudio leve para legenda' })
-        await notifyProgress('Extraindo áudio leve para legenda', 100)
-        captionAudioKey = await generateAndUploadCaptionAudio({
-          sourcePath,
-          tempDir,
-          outputPrefix,
-          bucket,
-        })
-      } catch (error) {
-        captionAudioError = error instanceof Error ? error.message : String(error)
-        console.warn('[videos] extração do áudio leve da legenda falhou:', captionAudioError)
-      }
-    }
-    let captionsQueued = false
-    if (captionsEnabled && captionsInline) {
-      await updateJob(args.jobId, { progress: 0, current_stage: 'HLS pronto; extraindo áudio da legenda' })
-      await notifyProgress('Extraindo áudio da legenda', 0)
-
-      const captionsResult = await generateAndUploadCaptionTracks({
-        sourcePath,
-        tempDir,
-        outputPrefix,
-        bucket,
-        onProgress: (stage, progress) => {
-          notifyProgress(stage, progress).catch(() => undefined)
-        },
-      })
-
-      captionTracks = captionsResult.captionTracks
-      primaryCaptionsKey = captionsResult.primaryCaptionsKey
-      await notifyProgress('Legendas enviadas para R2', 100)
-    } else if (captionsEnabled) {
-      await enqueueCaptionJob({
-        assetId: video.id,
-        sourceKey: video.source_key,
-        outputPrefix,
-        createdBy: args.userId,
-      })
-      captionsQueued = true
-      await notifyProgress('Vídeo pronto; legenda entrou na fila', 100)
-    }
-
-    await notifyProgress(
-      captionsInline && captionTracks.length > 0
-        ? 'Legendas concluídas'
-        : captionsQueued
-          ? 'Vídeo pronto; legenda entrou na fila'
-          : 'Vídeo pronto; legendas ficam para depois',
-      100,
-    )
-
-    await writeJsonMetadata(metadataKey, {
-      assetId: video.id,
-      title: video.title,
-      sourceKey: video.source_key,
-      manifestKey,
-      posterKey: finalPosterKey,
-      storyboardKey: finalStoryboardKey,
-      storyboard: finalStoryboardKey && storyboardPlan ? storyboardPlan : null,
-      captionAudioKey,
-      captionAudioError,
-      captionTracks,
+      sourceWidth: metadata.width,
+      sourceHeight: metadata.height,
+      hlsVariants: [buildHlsOutputVariant(metadata)].map((variant) => ({
+        label: variant.label,
+        width: variant.width,
+        height: variant.height,
+        playlist: variant.playlist,
+      })),
       processedAt: new Date().toISOString(),
       ...metadata,
     }, bucket)
@@ -1139,22 +1064,17 @@ export async function processVideoToHls(args: {
       status: 'completed',
       progress: 100,
       completed_at: new Date().toISOString(),
-      current_stage: captionsQueued ? 'HLS concluído; legenda na fila' : 'Concluído',
     })
-    await notifyProgress('Concluído', 100)
+    await notifyProgress('concluido', 100)
 
     await updateAsset(video.id, {
       status: 'ready',
       hls_prefix: outputPrefix,
       hls_manifest_key: manifestKey,
       poster_key: finalPosterKey,
-      ...(captionTracks.length > 0 ? {
-        captions_key: primaryCaptionsKey,
-        caption_tracks: captionTracks,
-      } : {}),
       duration_seconds: metadata.duration_seconds,
-      width: metadata.width,
-      height: metadata.height,
+      width: buildHlsOutputVariant(metadata).width || metadata.width,
+      height: buildHlsOutputVariant(metadata).height || metadata.height,
       processed_at: new Date().toISOString(),
       last_error: null,
       updated_by: args.userId,
@@ -1171,6 +1091,7 @@ export async function processVideoToHls(args: {
 
     return { manifestKey, posterKey: finalPosterKey, metadata }
   } catch (error) {
+    if (isVideoProcessingCancelled(error)) throw error
     const message = error instanceof Error ? error.message : String(error)
     await updateJob(args.jobId, {
       status: 'failed',
@@ -1179,7 +1100,7 @@ export async function processVideoToHls(args: {
       completed_at: new Date().toISOString(),
     })
     await updateAsset(video.id, {
-      status: hlsPersisted ? 'ready' : 'failed',
+      status: 'failed',
       last_error: message,
       updated_by: args.userId,
     })

@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { stat, writeFile } from 'node:fs/promises'
-import { Readable, Transform } from 'node:stream'
+import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import {
   AbortMultipartUploadCommand,
@@ -10,6 +10,7 @@ import {
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListPartsCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -113,13 +114,29 @@ export function guessContentType(key: string) {
   if (lower.endsWith('.mp4')) return 'video/mp4'
   if (lower.endsWith('.webm')) return 'video/webm'
   if (lower.endsWith('.mov')) return 'video/quicktime'
-  if (lower.endsWith('.wav')) return 'audio/wav'
   if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
   if (lower.endsWith('.png')) return 'image/png'
   if (lower.endsWith('.webp')) return 'image/webp'
   if (lower.endsWith('.vtt')) return 'text/vtt; charset=utf-8'
   if (lower.endsWith('.json')) return 'application/json; charset=utf-8'
   return 'application/octet-stream'
+}
+
+export function cacheControlForKey(key: string) {
+  const lower = key.toLowerCase()
+  if (lower.endsWith('.ts') || lower.endsWith('.m4s') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.webp')) {
+    return 'public, max-age=31536000, immutable'
+  }
+  if (lower.endsWith('.m3u8')) return 'public, max-age=300, stale-while-revalidate=86400'
+  if (lower.endsWith('.vtt') || lower.endsWith('.json')) return 'public, max-age=300'
+  return undefined
+}
+
+export function buildPublicR2ObjectUrl(publicBaseUrl: string, key: string) {
+  const base = publicBaseUrl.trim().replace(/\/+$/, '')
+  if (!base) return null
+  const encodedKey = key.split('/').map(encodeURIComponent).join('/')
+  return `${base}/${encodedKey}`
 }
 
 function bodyToReadable(body: any): Readable {
@@ -163,41 +180,14 @@ export async function downloadObjectToFile(key: string, destination: string, buc
   await pipeline(bodyToReadable(result.Body), createWriteStream(destination))
 }
 
-export type R2DownloadProgress = {
-  downloadedBytes: number
-  totalBytes: number | null
-  percent: number | null
-}
-
-export async function downloadObjectToFileWithProgress(
-  key: string,
-  destination: string,
-  bucket?: string | null,
-  onProgress?: (progress: R2DownloadProgress) => void | Promise<void>,
-) {
+export async function getObjectReadStream(key: string, bucket?: string | null) {
   const { client, config } = await getR2ClientAndConfigForBucket(bucket)
   const result = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: key }))
-  const totalBytes = Number(result.ContentLength || 0) > 0 ? Number(result.ContentLength) : null
-  let downloadedBytes = 0
-  let lastPercent = -1
-
-  const progressStream = new Transform({
-    transform(chunk, _encoding, callback) {
-      downloadedBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)
-      const percent = totalBytes
-        ? Math.max(0, Math.min(100, Math.round((downloadedBytes / totalBytes) * 100)))
-        : null
-
-      if (percent == null || percent !== lastPercent) {
-        if (percent != null) lastPercent = percent
-        Promise.resolve(onProgress?.({ downloadedBytes, totalBytes, percent })).catch(() => undefined)
-      }
-      callback(null, chunk)
-    },
-  })
-
-  await pipeline(bodyToReadable(result.Body), progressStream, createWriteStream(destination))
-  await Promise.resolve(onProgress?.({ downloadedBytes, totalBytes, percent: 100 })).catch(() => undefined)
+  return {
+    stream: bodyToReadable(result.Body),
+    contentLength: typeof result.ContentLength === 'number' ? result.ContentLength : null,
+    contentType: result.ContentType || guessContentType(key),
+  }
 }
 
 export async function uploadFileToR2(
@@ -235,6 +225,7 @@ export async function uploadBufferToR2(
     Key: key,
     Body: buffer,
     ContentType: contentType,
+    CacheControl: cacheControlForKey(key),
   }))
 }
 
@@ -257,7 +248,108 @@ export async function uploadStreamToR2(
     Key: key,
     Body: stream,
     ContentType: contentType,
+    CacheControl: cacheControlForKey(key),
     ...(contentLength && contentLength > 0 ? { ContentLength: contentLength } : {}),
+  }))
+}
+
+export function getBrowserMultipartPartSize(contentLength: number | null | undefined) {
+  const preferred = Math.max(8, Number(process.env.R2_BROWSER_MULTIPART_PART_SIZE_MB || 128)) * 1024 * 1024
+  const maxParts = 10_000
+  const required = contentLength && contentLength > 0 ? Math.ceil(contentLength / maxParts) : 0
+  return Math.max(5 * 1024 * 1024, preferred, required)
+}
+
+export async function createMultipartUploadForBrowser(
+  key: string,
+  contentType = guessContentType(key),
+  bucket?: string | null,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
+  const created = await client.send(new CreateMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    ContentType: contentType,
+  }))
+  if (!created.UploadId) throw new Error('R2 não retornou UploadId para multipart upload.')
+  return { uploadId: created.UploadId, bucket: config.bucket }
+}
+
+export async function createPresignedUploadPartUrl(
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  bucket?: string | null,
+  expiresInSeconds = 60 * 60 * 6,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
+  const command = new UploadPartCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: partNumber,
+  })
+  return getSignedUrl(client, command, { expiresIn: expiresInSeconds })
+}
+
+export async function completeMultipartUploadFromUploadedParts(
+  key: string,
+  uploadId: string,
+  bucket?: string | null,
+  expectedPartCount?: number | null,
+  expectedSize?: number | null,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
+  const parts: Array<{ ETag?: string; PartNumber?: number; Size?: number }> = []
+  let marker: string | undefined
+
+  do {
+    const result = await client.send(new ListPartsCommand({
+      Bucket: config.bucket,
+      Key: key,
+      UploadId: uploadId,
+      PartNumberMarker: marker,
+    }))
+    parts.push(...(result.Parts || []).map((part) => ({
+      ETag: part.ETag,
+      PartNumber: part.PartNumber,
+      Size: part.Size,
+    })))
+    marker = result.IsTruncated ? result.NextPartNumberMarker : undefined
+  } while (marker)
+
+  const validParts = parts
+    .filter((part): part is { ETag: string; PartNumber: number } => Boolean(part.ETag && part.PartNumber))
+    .sort((a, b) => a.PartNumber - b.PartNumber)
+
+  if (validParts.length === 0) throw new Error('Nenhuma parte enviada foi encontrada no R2.')
+  if (expectedPartCount && validParts.length !== expectedPartCount) {
+    throw new Error(`Upload incompleto no R2: ${validParts.length}/${expectedPartCount} partes enviadas.`)
+  }
+
+  const uploadedSize = parts.reduce((sum, part) => sum + Number(part.Size || 0), 0)
+  if (expectedSize && uploadedSize > 0 && uploadedSize !== expectedSize) {
+    throw new Error(`Upload incompleto no R2: ${uploadedSize}/${expectedSize} bytes enviados.`)
+  }
+
+  await client.send(new CompleteMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: uploadId,
+    MultipartUpload: { Parts: validParts },
+  }))
+}
+
+export async function abortMultipartUploadInR2(
+  key: string,
+  uploadId: string,
+  bucket?: string | null,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
+  await client.send(new AbortMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: uploadId,
   }))
 }
 
@@ -282,6 +374,7 @@ async function uploadStreamMultipartToR2(
     Bucket: bucket,
     Key: key,
     ContentType: contentType,
+    CacheControl: cacheControlForKey(key),
   }))
   const uploadId = created.UploadId
   if (!uploadId) throw new Error('R2 não retornou UploadId para multipart upload.')
@@ -340,14 +433,42 @@ async function uploadStreamMultipartToR2(
   }
 }
 
-export async function createPresignedPutUrl(key: string, contentType: string, expiresInSeconds = 60 * 60 * 2) {
-  const { client, config } = await getR2ClientAndConfig()
+export async function createPresignedPutUrl(
+  key: string,
+  contentType: string,
+  expiresInSeconds = 60 * 60 * 2,
+  bucket?: string | null,
+) {
+  const { client, config } = await getR2ClientAndConfigForBucket(bucket)
   const command = new PutObjectCommand({
     Bucket: config.bucket,
     Key: key,
     ContentType: contentType,
   })
   return getSignedUrl(client, command, { expiresIn: expiresInSeconds })
+}
+
+function encodeDispositionFilename(filename: string) {
+  const fallback = sanitizeFileSegment(filename).replace(/[^\x20-\x7E]/g, '') || 'download'
+  const encoded = encodeURIComponent(filename).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
+}
+
+export async function createPresignedDownloadUrl(args: {
+  key: string
+  bucket?: string | null
+  filename: string
+  contentType?: string | null
+  expiresInSeconds?: number
+}) {
+  const { client, config } = await getR2ClientAndConfigForBucket(args.bucket)
+  const command = new GetObjectCommand({
+    Bucket: config.bucket,
+    Key: args.key,
+    ResponseContentDisposition: encodeDispositionFilename(args.filename),
+    ResponseContentType: args.contentType || guessContentType(args.key),
+  })
+  return getSignedUrl(client, command, { expiresIn: args.expiresInSeconds || 60 * 60 * 2 })
 }
 
 export async function headR2Object(key: string, bucket?: string | null) {
